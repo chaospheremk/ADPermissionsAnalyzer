@@ -15,6 +15,14 @@ on:
       - 'requirements.txt'
       - '**/*.ps1'
       - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements.txt'
+      - '**/*.ps1'
+      - '.github/workflows/docs.yml'
 
 permissions:
   contents: read
@@ -29,9 +37,9 @@ jobs:
   build-and-deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    # On PR: build-only validation (no deploy environment binding).
+    # On push to main: full build + deploy with github-pages environment.
+    environment: ${{ github.event_name == 'push' && 'github-pages' || null }}
 
     steps:
       - name: Checkout
@@ -61,10 +69,12 @@ jobs:
         run: zensical build
 
       - name: Upload Pages artifact
+        if: github.event_name == 'push'
         uses: actions/upload-pages-artifact@v5
         with:
           path: site/
 
       - name: Deploy to GitHub Pages
+        if: github.event_name == 'push'
         id: deployment
         uses: actions/deploy-pages@v5

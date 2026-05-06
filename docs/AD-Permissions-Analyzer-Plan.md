@@ -12,7 +12,8 @@
 |---|---|
 | Domain scope | Single domain (parameterized; default = current) |
 | Naming contexts | All: Domain NC, Configuration NC, Schema NC, all DNS application partitions |
-| ACL types | DACL only (SACL excluded) |
+| SD scope | DACL + Owner (SACL and Group excluded) — Owner is captured and surfaced as a synthetic ACE row in detail CSV |
+| SD control flags | Captured: `SE_DACL_PROTECTED` surfaced as `IsDaclProtected` column |
 | Object-specific ACE decoding | Yes — resolve property, property-set, extended-right, and child-class GUIDs to human names |
 | Inherited ACE handling | Capture all ACEs; flag inherited; resolve and record the source DN where the ACE was originally defined |
 | Trustee group expansion | Yes — transitive expansion of group trustees to effective members |
@@ -27,6 +28,7 @@
 ## 2. Explicitly Out of Scope
 
 - SACL / audit ACE enumeration
+- SD's Group identifier (rarely meaningful in modern AD)
 - Multi-domain / forest-wide enumeration
 - Cross-forest trust traversal
 - Offline `ntdsutil ifm` snapshot mode
@@ -107,7 +109,9 @@ Invoke-ADPermissionAnalysis
     -LogFileName          <string>   # Default: "ADPermissions_<yyyyMMdd-HHmmss>.jsonl"
     -BatchSize            <int>      # Default: 250 objects per runspace work unit
     -ThreadCount          <int>      # Default: [Environment]::ProcessorCount
+                                     # [ValidateRange(1, 32)] — values >16 typically waste effort (LDAP becomes the bottleneck)
     -PageSize             <int>      # Default: 1000 (LDAP page size)
+                                     # [ValidateRange(100, 1000)] — server-side cap is 1000 in AD
     -IncludeNamingContexts <string[]> # Default: @('Domain','Configuration','Schema','DNS')
                                        # Allow filtering for testing
     -SkipTransitiveExpansion <switch>  # Escape hatch; default off
@@ -123,18 +127,22 @@ Each function lives in its own logical section with comment-based help (Synopsis
 
 ### Phase 1 — Discovery & Maps
 - `Get-ADNamingContext` — returns `[List[PSObject]]` of NCs with DN, type (Domain/Config/Schema/DNS), and root DSE attributes.
-- `New-ADExtendedRightsMap` — returns `[Dictionary[guid,PSObject]]` keyed by `rightsGuid`. Source: `CN=Extended-Rights,CN=Configuration,...`. Each value carries `DisplayName`, `AppliesTo` (schema GUIDs), `ValidAccesses` (mask).
-- `New-ADSchemaGuidMap` — returns `[Dictionary[guid,PSObject]]` keyed by `schemaIDGUID`. Source: Schema NC. Each value carries `LdapDisplayName`, `ObjectCategory` (attributeSchema vs classSchema), `IsPropertySet`, `PropertySetMembers` (for property sets, the constituent attribute GUIDs).
-- `New-WellKnownSidMap` — static `[Dictionary[string,string]]` of well-known SIDs not resolvable via `NTAccount.Translate()` reliably (S-1-5-32-* etc. usually work, but pre-populate edge cases like `S-1-3-0`/Creator Owner, `S-1-5-10`/Self, `S-1-5-9`/Enterprise DCs).
+- `New-ADExtendedRightsMap` — returns `[Dictionary[guid,PSObject]]` keyed by `rightsGuid`. Source: `CN=Extended-Rights,CN=Configuration,...`. Covers all `controlAccessRight` objects: extended rights, validated writes, AND property sets — distinguish by `validAccesses` (`0x100` = extended right, `0x08` = validated write, `0x30` = property set). Each value carries `DisplayName`, `AppliesTo` (schema GUIDs), `ValidAccesses` (mask), `RightKind` (`'ExtendedRight'`/`'ValidatedWrite'`/`'PropertySet'`).
+- `New-ADSchemaGuidMap` — returns `[Dictionary[guid,PSObject]]` keyed by `schemaIDGUID`. Source: Schema NC. Each value carries `LdapDisplayName`, `ObjectCategory` (attributeSchema vs classSchema). Used to resolve **single attributes** (`ReadProperty`/`WriteProperty` ACEs targeting one attribute) and **object classes** (`CreateChild`/`DeleteChild`/`InheritedObjectType`). Property sets are **not** in this map — they're in ExtendedRightsMap.
+- `New-PropertySetMembersMap` — returns `[Dictionary[guid,List[string]]]` keyed by property-set `rightsGuid`, value is the list of `lDAPDisplayName`s of member attributes. Source: Schema NC `attributeSchema` objects whose `attributeSecurityGUID` attribute is non-null — that GUID matches the property set's `rightsGuid` (an extended-right GUID, NOT a schema GUID). Reverse-indexed during construction.
+- `New-WellKnownSidMap` — static `[Dictionary[string,string]]` of well-known SIDs not resolvable via `NTAccount.Translate()` reliably (S-1-5-32-* etc. usually work, but pre-populate edge cases like `S-1-3-0`/Creator Owner, `S-1-5-10`/Self, `S-1-5-9`/Enterprise DCs). See §10 for the full no-expand SID list this map must cover.
 
 ### Phase 2 — Enumeration
-- `Get-ADObjectAclBatch` — paged LDAP search via `System.DirectoryServices.Protocols.LdapConnection` + `SearchRequest` + `PageResultRequestControl` + `SecurityDescriptorFlagControl(DACL)`. Yields batches of `[List[PSObject]]` (DN, ObjectClass, ObjectGUID, raw `nTSecurityDescriptor` byte[]). Implements early exit on empty result set.
+- `Get-ADObjectAclBatch` — paged LDAP search via `System.DirectoryServices.Protocols.LdapConnection` + `SearchRequest` + `PageResultRequestControl` + `SecurityDescriptorFlagControl(OWNER | DACL)`. Yields batches of `[List[PSObject]]` (DN, `structuralObjectClass` (with `objectClass` last-value as fallback), ObjectGUID, raw `nTSecurityDescriptor` byte[]). Implements early exit on empty result set.
+  - **LDAP connection auth:** `LdapConnection.AuthType = AuthType.Negotiate` (Kerberos with NTLM fallback). Use `LdapDirectoryIdentifier` with `connectionless: $false` and `fullyQualifiedDnsHostName: $true`. LDAPS (port 636) and Basic auth are not supported in v1.
+  - **Why both OWNER and DACL flags:** Owner is part of the SD and required for least-privilege analysis (the owner has implicit `READ_CONTROL`/`WRITE_DAC` regardless of DACL). Including OWNER in `SecurityDescriptorFlagControl` adds zero LDAP roundtrips — same paged search.
   - **Why S.DS.Protocols, not the AD module:** AD module's `Get-ACL` per object = 30k LDAP roundtrips. Paged S.DS.P with `SecurityDescriptorFlagControl` retrieves SD inline with the search and is 1–2 orders of magnitude faster. Memory stays bounded via paging.
 
 ### Phase 3 — ACE Parsing (runs inside runspace pool)
-- `ConvertFrom-NtSecurityDescriptor` — accepts raw `byte[]`, returns `[ActiveDirectorySecurity]` (`new-object` + `SetSecurityDescriptorBinaryForm`). DACL only.
-- `ConvertFrom-AdAce` — accepts a single `ActiveDirectoryAccessRule`, returns a flat `PSObject` with: `ObjectDN`, `ObjectClass`, `ObjectGUID`, `TrusteeSid`, `AccessMask`, `AccessControlType` (Allow/Deny), `AceType` (e.g., `AccessAllowedObject`), `RightsDecoded` (e.g., `GenericAll, ReadProperty, WriteProperty`), `ObjectTypeGuid`, `ObjectTypeName` (decoded via maps), `ObjectTypeKind` (Property/PropertySet/ExtendedRight/Class/All), `InheritedObjectTypeGuid`, `InheritedObjectTypeName`, `InheritanceFlags`, `IsInherited`, `AceFlagsRaw`.
-- `Invoke-AceParsingWorkUnit` — runspace work-unit body. Accepts a batch + the GUID maps (passed by reference into the runspace). Returns `[List[PSObject]]` of ACE records.
+- `ConvertFrom-NtSecurityDescriptor` — accepts raw `byte[]`, returns a record carrying `Owner` (`SecurityIdentifier`), `Dacl` (`ActiveDirectorySecurity`), and `IsDaclProtected` (`bool`, from `ActiveDirectorySecurity.AreAccessRulesProtected` which surfaces the `SE_DACL_PROTECTED` control bit). Built via `new-object [ActiveDirectorySecurity]` + `SetSecurityDescriptorBinaryForm`. DACL + Owner.
+- `Add-OwnerAce` — emits a synthetic ACE record from the parsed Owner SID: `AceType = 'Synthetic.Owner'`, `RightsDecoded = 'OwnerImplicit'`, `AccessMask = (ReadControl | WriteDacl | WriteOwner)`, `IsInherited = $false`, `IsDaclProtected = <inherited from object>`, `TrusteeSid = $owner.Value`. One synthetic row per object regardless of DACL contents.
+- `ConvertFrom-AdAce` — accepts a single `ActiveDirectoryAccessRule` plus the parent object's `IsDaclProtected` flag, returns a flat `PSObject` with: `ObjectDN`, `ObjectClass`, `ObjectGUID`, `TrusteeSid`, `AccessMask`, `AccessControlType` (Allow/Deny), `AceType` (e.g., `AccessAllowedObject`), `RightsDecoded` (e.g., `GenericAll, ReadProperty, WriteProperty`), `ObjectTypeGuid`, `ObjectTypeName` (decoded via maps), `ObjectTypeKind` (Property/PropertySet/ExtendedRight/ClassChild/All/Unresolved), `InheritedObjectTypeGuid`, `InheritedObjectTypeName`, `InheritanceFlags`, `IsInherited`, `IsDaclProtected`, `AceIndex` (0-based ordinal within the source DACL), `AceFlagsRaw`.
+- `Invoke-AceParsingWorkUnit` — runspace work-unit body. Accepts a batch + the GUID maps (`ExtendedRightsMap`, `SchemaGuidMap`, `PropertySetMembersMap`, passed by reference into the runspace). For each object: parse SD → emit synthetic Owner ACE → enumerate DACL ACEs → emit one record each. Returns `[List[PSObject]]` of ACE records.
 
 ### Phase 4 — Trustee Resolution
 - `Resolve-TrusteeSid` — accepts SID string. Resolution order:
@@ -143,24 +151,25 @@ Each function lives in its own logical section with comment-based help (Synopsis
   3. Well-known SID map
   4. ForeignSecurityPrincipals container (`CN=ForeignSecurityPrincipals,<domainNC>`)
   5. Mark as `Orphaned`
-- Returns `PSObject`: `Sid`, `Name` (DOMAIN\sam or fallback), `PrincipalType` (User/Group/Computer/ManagedServiceAccount/ForeignSecurityPrincipal/WellKnown/Orphaned/Unknown), `DistinguishedName` (when resolvable in-domain).
+- Returns `PSObject`: `Sid`, `Name` (DOMAIN\sam or fallback), `PrincipalType` (User/Group/Computer/ManagedServiceAccount/GroupManagedServiceAccount/ForeignSecurityPrincipal/WellKnown/Orphaned/Unknown), `DistinguishedName` (when resolvable in-domain). `ManagedServiceAccount` corresponds to `objectClass=msDS-ManagedServiceAccount` (legacy sMSA); `GroupManagedServiceAccount` corresponds to `objectClass=msDS-GroupManagedServiceAccount` (current gMSA).
 - `Expand-GroupTransitive` — for trustees of type Group, returns `[List[PSObject]]` of effective member principals. Use `LDAP_MATCHING_RULE_IN_CHAIN` (OID `1.2.840.113556.1.4.1941`) on `memberOf` for performance: one query per group resolves the entire transitive closure. Cache group → expanded-member-set keyed by group SID. Detect and break circular cases (the matching rule handles cycles, but cap recursion as a safety net).
 - `Get-DistinctTrusteeSet` — single pass over the ACE record list to dedupe SIDs before resolving. 30k × 30 ACEs avg = ~900k ACE rows but typically <5k distinct trustees.
 
 ### Phase 5 — Inheritance Source
 - `Resolve-InheritanceSource` — for each ACE where `IsInherited = $true`:
-  1. Walk parent chain of `ObjectDN` upward.
-  2. At each ancestor, look up explicit ACEs (already in the result set, indexed by `ObjectDN`) matching trustee SID + access mask + object-type GUID + inheritance flags consistent with propagation to current object class.
-  3. The deepest matching ancestor is `InheritanceSourceDN`. If none found (rare; possible with default schema ACEs that originate at the domain root or have no explicit form), record `InheritanceSourceDN = $null` and `InheritanceSourceNote = 'SchemaDefaultOrUnresolved'`.
-- Build a `[Dictionary[string,List[PSObject]]]` index of explicit ACEs keyed by DN before the resolution loop. Avoids O(n²).
+  1. If the ACE's parent object has `IsDaclProtected = $true`, log `BatchError` and mark `InheritanceSourceNote = 'InconsistentProtectedDacl'` (an inherited ACE on a protected DACL is internally inconsistent).
+  2. Otherwise walk parent chain of `ObjectDN` upward.
+  3. At each ancestor, direct-lookup the composite-key `$AceIndex` (see §9) by `(parent DN, TrusteeSid, AccessMask, ObjectTypeGuid)`; for each candidate verify `InheritanceFlagsPropagateTo` to the descendant.
+  4. The first match walking up is by definition the **nearest** matching ancestor — record as `InheritanceSourceDN`. If none found (rare; possible with default schema ACEs that originate at the domain root or have no explicit form), record `InheritanceSourceDN = $null` and `InheritanceSourceNote = 'SchemaDefaultOrUnresolved'`.
+- Index construction: build a `[Dictionary[ValueTuple[string,string,uint32,guid], List[PSObject]]]` over **explicit** ACEs only, keyed by `(ObjectDN, TrusteeSid, AccessMask, ObjectTypeGuid)`. See §9 for the algorithm. Direct lookup at each ancestor → O(n × depth); old DN-only key was O(n × depth × candidates_per_dn).
 
 ### Phase 6 — Output
 - `Write-DetailCsv` — opens `StreamWriter`, writes header, streams rows. One row per `(ACE × effective trustee)`. Schema in §11.
 - `Write-PivotCsv` — aggregates the in-memory ACE+trustee join. One row per effective trustee. Schema in §11.
 
 ### Cross-cutting
-- `Write-Log` — JSONL. Fields: `timestamp` (ISO-8601 UTC), `level`, `phase`, `event`, `message`, `data` (object). Used for milestones and errors only — no per-object spam. Emit phase-start / phase-end with counts.
-- `New-RunspacePool` — wraps `[runspacefactory]::CreateRunspacePool`. `InitialSessionState` carries the GUID maps and the well-known SID map preloaded so each runspace doesn't rebuild them.
+- `Write-LogEvent` — JSONL. Fields: `timestamp` (ISO-8601 UTC), `level`, `phase`, `event`, `message`, `data` (object). Used for milestones and errors only — no per-object spam. Emit phase-start / phase-end with counts. (Named `Write-LogEvent` — not `Write-Log` — because `Log` is not an approved PowerShell verb; PSScriptAnalyzer rule `PSUseApprovedVerbs` enforces this.)
+- `New-RunspacePool` — wraps `[runspacefactory]::CreateRunspacePool`. `InitialSessionState` carries the GUID maps (`ExtendedRightsMap`, `SchemaGuidMap`, `PropertySetMembersMap`) and the well-known SID map preloaded so each runspace doesn't rebuild them.
 - `Invoke-RunspacePoolWork` — generic dispatcher: accepts pool + work-unit scriptblock + collection of input batches; returns aggregated results. Uses `BeginInvoke`/`EndInvoke`. Captures per-batch failures into a separate error list (does not throw — log and continue per house style).
 
 ---
@@ -170,16 +179,18 @@ Each function lives in its own logical section with comment-based help (Synopsis
 | Structure | Type | Purpose |
 |---|---|---|
 | `$NamingContexts` | `List[PSObject]` | NC list from Phase 1 |
-| `$ExtendedRightsMap` | `Dictionary[guid,PSObject]` | rightsGuid → name |
-| `$SchemaGuidMap` | `Dictionary[guid,PSObject]` | schemaIDGUID → name |
+| `$ExtendedRightsMap` | `Dictionary[guid,PSObject]` | rightsGuid → name (extended rights, validated writes, property sets) |
+| `$SchemaGuidMap` | `Dictionary[guid,PSObject]` | schemaIDGUID → name (single attributes, object classes) |
+| `$PropertySetMembersMap` | `Dictionary[guid,List[string]]` | property-set rightsGuid → member attribute names |
 | `$WellKnownSidMap` | `Dictionary[string,string]` | SID → friendly name |
 | `$AceRecords` | `List[PSObject]` | All parsed ACEs (Phase 3 output) |
-| `$AceByDn` | `Dictionary[string,List[PSObject]]` | Inheritance index |
+| `$AceIndex` | `Dictionary[ValueTuple[string,string,uint32,guid], List[PSObject]]` | Inheritance composite-key index — see §9 |
 | `$TrusteeCache` | `Dictionary[string,PSObject]` | SID → resolved principal |
 | `$GroupExpansionCache` | `Dictionary[string,List[PSObject]]` | Group SID → transitive members |
+| `$PivotStats` | `Dictionary[string,PSObject]` | Effective-trustee SID → running aggregates (built during streaming detail write — see §12) |
 | `$ErrorBag` | `List[PSObject]` | Captured errors |
 
-Memory note: 900k ACE rows × ~400 bytes ≈ ~360 MB. Acceptable on an admin workstation. After detail CSV is written, set `$AceRecords = $null` before pivot generation if pivot can be derived from a streaming re-read; otherwise keep in memory and clean up at end with `Remove-Variable`.
+Memory note: 900k ACE rows × ~400 bytes ≈ ~360 MB pre-expansion. Acceptable on an admin workstation. **Detail rows are NOT materialised in memory** — Phase 6 streams `(ACE × effective trustee)` rows directly to the detail CSV `StreamWriter` while updating `$PivotStats` aggregates incrementally (see §12). Worst-case 5M expanded rows would be ~2 GB if held; streaming caps peak memory at the aggregate state size (~5k trustees × few KB ≈ ~5 MB). After detail CSV is written, the script writes pivot from `$PivotStats` and clears all caches via `Remove-Variable`.
 
 ---
 
@@ -195,17 +206,19 @@ For each `ActiveDirectoryAccessRule`:
 
 **ObjectType GUID interpretation** — depends on `AceType` and `RightsDecoded`:
 
-| Right | ObjectType GUID means |
-|---|---|
-| `ExtendedRight` | Extended right (look up in ExtendedRightsMap) |
-| `ReadProperty` / `WriteProperty` | Single attribute or property set (look up in SchemaGuidMap; if it's a property set, also list members) |
-| `CreateChild` / `DeleteChild` | Child object class (look up classSchema) |
-| `Self` | Validated write (extended right namespace) |
-| (none / zero GUID) | Applies to all properties / all child types |
+| Right | ObjectType GUID means | Resolution order |
+|---|---|---|
+| `ExtendedRight` | Extended right or validated write | ExtendedRightsMap (`validAccesses=0x100` or `0x08`) |
+| `ReadProperty` / `WriteProperty` | Property set OR single attribute | 1. ExtendedRightsMap with `validAccesses=0x30` → property set (also list members from `PropertySetMembersMap`); 2. SchemaGuidMap → single attribute; 3. else → unresolved |
+| `CreateChild` / `DeleteChild` | Child object class | SchemaGuidMap (filtered to `classSchema`) |
+| `Self` | Validated write | ExtendedRightsMap (`validAccesses=0x08`) |
+| (none / zero GUID) | Applies to all properties / all child types | — |
 
-**InheritedObjectType GUID** — only meaningful for ACEs that propagate; identifies the child class the ACE applies to when inherited (e.g., "applies to descendant `user` objects only"). Resolve same way as a class GUID.
+**InheritedObjectType GUID** — only meaningful for ACEs that propagate; identifies the child class the ACE applies to when inherited (e.g., "applies to descendant `user` objects only"). Resolve via SchemaGuidMap (`classSchema` filter).
 
-`ObjectTypeKind` field disambiguates which lookup table produced the name.
+`ObjectTypeKind` field disambiguates which lookup produced the name. Values: `Property` (single attribute), `PropertySet`, `ExtendedRight`, `ValidatedWrite`, `ClassChild`, `All` (zero GUID), `Unresolved` (no map hit — record raw GUID for forensics).
+
+**`IsDaclProtected` propagation** — every ACE record carries the parent object's `IsDaclProtected` flag (extracted in Phase 3 from `ActiveDirectorySecurity.AreAccessRulesProtected`). When `true`, the object's DACL is shielded from inheritance (`SE_DACL_PROTECTED` / "Disable inheritance" in the GUI), and no inherited ACEs should appear on it. The Phase 5 inheritance-source resolver uses this as an internal-consistency check (see §9).
 
 ---
 
@@ -216,35 +229,81 @@ For each `ActiveDirectoryAccessRule`:
 - Filter: `(objectClass=controlAccessRight)`
 - Attributes: `cn`, `displayName`, `rightsGuid`, `appliesTo`, `validAccesses`
 - Key: `[guid]$rightsGuid`
+- Covers all three kinds of `controlAccessRight`:
+  - **Extended rights** — `validAccesses = 0x100` (`ADS_RIGHT_DS_CONTROL_ACCESS`). Examples: `User-Force-Change-Password`, `DS-Replication-Get-Changes-All` (DCSync).
+  - **Validated writes** — `validAccesses = 0x08` (`ADS_RIGHT_DS_SELF`). Examples: `Validated-DNS-Host-Name`, `Self-Membership`.
+  - **Property sets** — `validAccesses = 0x30` (`ADS_RIGHT_DS_READ_PROP | ADS_RIGHT_DS_WRITE_PROP`). Examples: `Personal-Information`, `Phone-and-Mail-Options`.
+- Each value carries `RightKind` field (`'ExtendedRight'`/`'ValidatedWrite'`/`'PropertySet'`) derived from `validAccesses` to simplify §7 lookup logic.
 
 **SchemaGuidMap source:**
 - LDAP search: `<schemaNC>`
 - Filter: `(|(objectClass=attributeSchema)(objectClass=classSchema))`
-- Attributes: `lDAPDisplayName`, `schemaIDGUID`, `objectClass`, `attributeSecurityGUID` (for property set membership)
+- Attributes: `lDAPDisplayName`, `schemaIDGUID`, `objectClass`
 - Key: `[guid][byte[]]$schemaIDGUID`
-- Property sets: classSchema-derived; member attributes carry `attributeSecurityGUID` matching the property set's `schemaIDGUID`. Build reverse index.
+- Each value carries `LdapDisplayName` and `ObjectCategory` (`'attributeSchema'` or `'classSchema'`).
+- **Does NOT contain property sets.** Property sets are `controlAccessRight` objects in the Configuration NC (Extended-Rights container), not schema objects. They live in ExtendedRightsMap. The link from a member attribute to its property set is via the property set's `rightsGuid` (an extended-right GUID), not its `schemaIDGUID`.
 
-**Page size:** 1000 for both. Both maps are bounded (~hundreds for extended rights, ~3000 for schema).
+**PropertySetMembersMap source:**
+- LDAP search: `<schemaNC>`
+- Filter: `(&(objectClass=attributeSchema)(attributeSecurityGUID=*))` — only attributes that are members of a property set
+- Attributes: `lDAPDisplayName`, `attributeSecurityGUID`
+- Key: `[guid][byte[]]$attributeSecurityGUID` (= the property set's `rightsGuid`)
+- Value: `List[string]` of `lDAPDisplayName`s of attributes belonging to that property set.
+- Built as a reverse index: each row contributes one entry to the list under its property set's key.
+
+**Page size:** 1000 for all three. Maps are bounded: ~hundreds for extended rights, ~3000 for schema, ~hundreds of distinct property sets each with a few to dozens of member attributes.
 
 ---
 
 ## 9. Inheritance Source Resolution — Algorithm
 
+**Index construction (before the resolution loop):**
+
+Build a composite-key index over **explicit** ACEs only:
+
+```
+$AceIndex = Dictionary[ValueTuple[string, string, uint32, guid], List[PSObject]]()
+
+foreach ($ace in $AceRecords) {
+    if ($ace.IsInherited) { continue }
+    $key = [ValueTuple[string, string, uint32, guid]]::new(
+        $ace.ObjectDN,        # parent DN we'll lookup
+        $ace.TrusteeSid,
+        $ace.AccessMask,
+        $ace.ObjectTypeGuid ?? [guid]::Empty
+    )
+    if (-not $AceIndex.ContainsKey($key)) {
+        $AceIndex[$key] = [List[PSObject]]::new()
+    }
+    $AceIndex[$key].Add($ace)
+}
+```
+
+This trades a small amount of memory for direct-lookup match (no `.Where()` scan per ancestor). Worst-case complexity drops from O(n × depth × candidates_per_dn) ≈ ~90M ops at the design ceiling to O(n × depth) ≈ ~9M ops.
+
+**Resolution loop:**
+
 ```
 For each ACE where IsInherited = true:
+    if ACE.IsDaclProtected:
+        # Internal-consistency check: a DACL_PROTECTED object should have
+        # NO inherited ACEs. If we see one, log a BatchError — likely a
+        # malformed SD or a parser bug.
+        Log-BatchError 'InheritedAceOnProtectedDacl' $ACE
+        ACE.InheritanceSourceDN = null
+        ACE.InheritanceSourceNote = 'InconsistentProtectedDacl'
+        continue
+
     parent = Parent(ACE.ObjectDN)
     while parent is not null and parent is within any enumerated NC:
-        candidates = AceByDn[parent]  # explicit ACEs only
+        key = (parent, ACE.TrusteeSid, ACE.AccessMask, ACE.ObjectTypeGuid ?? Empty)
+        candidates = $AceIndex[key]  # may be empty
         match = candidates.Where({
-            $_.IsInherited -eq $false -and
-            $_.TrusteeSid -eq ACE.TrusteeSid -and
-            $_.AccessMask -eq ACE.AccessMask -and
-            $_.ObjectTypeGuid -eq ACE.ObjectTypeGuid -and
             InheritanceFlagsPropagateTo(parent, ACE.ObjectDN, ACE.ObjectClass, $_.InheritanceFlags, $_.InheritedObjectTypeGuid)
         })
         if match.Count -gt 0:
             ACE.InheritanceSourceDN = parent
-            break
+            break    # first match walking up is by definition the nearest ancestor
         parent = Parent(parent)
     if not found:
         ACE.InheritanceSourceDN = null
@@ -255,7 +314,8 @@ For each ACE where IsInherited = true:
 
 **Edge cases to handle:**
 - ACEs originating from `defaultSecurityDescriptor` of the schema class (no explicit parent ACE exists for these — they're materialized at object creation). Mark `SchemaDefaultOrUnresolved`.
-- Multiple matching ancestors (e.g., same ACE explicitly placed at two levels): record the deepest.
+- Multiple matching ancestors (e.g., same ACE explicitly placed at two levels): record the **nearest matching ancestor** — the one closest to the descendant by parent-chain distance. The walk-up algorithm finds it first by construction.
+- Inherited ACE seen on a `DACL_PROTECTED` object: log `BatchError` and mark `InheritanceSourceNote = 'InconsistentProtectedDacl'`. Should not occur for a well-formed SD.
 - ACEs on cross-NC objects (rare): stay within the originating NC.
 
 ---
@@ -266,7 +326,9 @@ Categorize every trustee into exactly one `PrincipalType`:
 
 | Category | Detection |
 |---|---|
-| `User` / `Group` / `Computer` / `ManagedServiceAccount` | Resolved via in-domain LDAP lookup; `objectClass` determines type |
+| `User` / `Group` / `Computer` | Resolved via in-domain LDAP lookup; `objectClass` determines type |
+| `ManagedServiceAccount` | `objectClass = msDS-ManagedServiceAccount` (legacy sMSA) |
+| `GroupManagedServiceAccount` | `objectClass = msDS-GroupManagedServiceAccount` (current gMSA) |
 | `WellKnown` | Resolved via `NTAccount.Translate()` to `BUILTIN\*` or `NT AUTHORITY\*`, or matched in WellKnownSidMap |
 | `ForeignSecurityPrincipal` | Found as object under `CN=ForeignSecurityPrincipals,<domainNC>` |
 | `Orphaned` | All resolution paths failed; SID format valid; likely deleted account |
@@ -275,6 +337,36 @@ Categorize every trustee into exactly one `PrincipalType`:
 Output row always contains the raw SID string regardless of category. Orphaned trustees still get a row in the detail CSV — they are exactly the kind of finding least-privilege reviews want to surface. Pivot CSV groups orphans together for visibility.
 
 Do not throw on unresolvable SIDs. Log one structured event per distinct orphan SID at INFO level (`event: "OrphanSid"`).
+
+### Well-known SIDs that MUST NOT be transitively expanded
+
+Treat the following as terminal trustees in detail/pivot CSVs (no group-membership expansion). These either have implicit/runtime-computed memberships not retrievable via `LDAP_MATCHING_RULE_IN_CHAIN`, or have memberships so large that expansion produces a meaningless explosion of rows.
+
+```
+Cross-domain / well-known (full SIDs):
+  S-1-1-0   Everyone
+  S-1-5-7   Anonymous Logon
+  S-1-5-11  Authenticated Users
+  S-1-5-2   Network
+  S-1-5-4   Interactive
+  S-1-5-9   Enterprise Domain Controllers
+  S-1-5-10  Self / Principal Self
+  S-1-3-0   Creator Owner
+  S-1-3-1   Creator Group
+
+Domain-relative (RID; prefix with current domain SID at runtime):
+  -498  Enterprise Read-only Domain Controllers
+  -513  Domain Users
+  -514  Domain Guests
+  -515  Domain Computers
+  -516  Domain Controllers
+  -521  Read-only Domain Controllers
+
+BUILTIN aliases (S-1-5-32-*): treat as terminal — they resolve via NTAccount.Translate()
+to local-machine groups and have no AD-wide membership semantics relevant to AD ACL analysis.
+```
+
+Implementation: a single `[HashSet[string]]` of full SIDs (well-known) plus a list of RIDs to combine with the runtime-discovered domain SID. `Resolve-TrusteeSid` checks this set before invoking `Expand-GroupTransitive`; matched trustees are returned with `EffectiveTrusteeSid = AceTrusteeSid` (themselves) and `IsThroughGroup = $false`.
 
 ---
 
@@ -287,7 +379,7 @@ One row per `(target object × ACE × effective trustee)` after group expansion.
 | Column | Type | Notes |
 |---|---|---|
 | `ObjectDN` | string | Target object DN |
-| `ObjectClass` | string | Most-specific class (last value of `objectClass`) |
+| `ObjectClass` | string | `structuralObjectClass` if present; else last value of `objectClass` |
 | `ObjectGUID` | guid | |
 | `NamingContext` | string | Domain / Configuration / Schema / DNS:<partition> |
 | `AceTrusteeSid` | string | Raw SID from ACE |
@@ -299,20 +391,25 @@ One row per `(target object × ACE × effective trustee)` after group expansion.
 | `EffectiveTrusteeDN` | string | When in-domain |
 | `IsThroughGroup` | bool | True if effective trustee differs from ACE trustee |
 | `GroupExpansionPath` | string | Semicolon-delimited group chain (e.g., "GroupA -> NestedGroupB"); empty for direct |
+| `AceType` | string | E.g., `AccessAllowedObject`, `AccessDeniedObject`, or `Synthetic.Owner` |
+| `AceIndex` | int | 0-based ordinal of the ACE within the source DACL (before group expansion). For `Synthetic.Owner` rows: `-1`. |
 | `AccessControlType` | string | Allow / Deny |
-| `RightsDecoded` | string | Comma-delimited rights |
-| `AccessMask` | uint32 | Raw mask for diffing |
+| `RightsDecoded` | string | Comma-delimited rights. For `Synthetic.Owner`: `'OwnerImplicit'` |
+| `AccessMask` | uint32 | Raw mask for diffing. For `Synthetic.Owner`: `(ReadControl \| WriteDacl \| WriteOwner)` |
 | `ObjectTypeGuid` | guid? | |
 | `ObjectTypeName` | string | Decoded |
-| `ObjectTypeKind` | string | Property / PropertySet / ExtendedRight / ClassChild / All |
+| `ObjectTypeKind` | string | Property / PropertySet / ExtendedRight / ValidatedWrite / ClassChild / All / Unresolved |
 | `InheritedObjectTypeGuid` | guid? | |
 | `InheritedObjectTypeName` | string | |
 | `IsInherited` | bool | |
+| `IsDaclProtected` | bool | True if the parent object's DACL has `SE_DACL_PROTECTED` set (inheritance disabled). All ACEs on a protected object share the same value. |
 | `InheritanceSourceDN` | string | Empty for explicit; populated for inherited |
-| `InheritanceSourceNote` | string | E.g., "SchemaDefaultOrUnresolved" |
+| `InheritanceSourceNote` | string | E.g., `SchemaDefaultOrUnresolved`, `InconsistentProtectedDacl` |
 | `InheritanceFlags` | string | ContainerInherit / ObjectInherit / etc. |
 | `AceFlagsRaw` | byte | Raw byte for forensics |
 | `CollectedAt` | datetime | UTC ISO-8601 |
+
+**Synthetic Owner row:** every object emits exactly one row with `AceType = 'Synthetic.Owner'` capturing the SD's owner. The owner has implicit `READ_CONTROL`/`WRITE_DAC`/`WRITE_OWNER` regardless of DACL, so this row makes that access path visible in least-privilege analysis. `AceIndex = -1` distinguishes it from real DACL ACEs (which start at 0).
 
 ### Pivot CSV — `ADPermissions_Pivot_<timestamp>.csv`
 
@@ -370,7 +467,28 @@ $pool.Close(); $pool.Dispose()
 **Memory hygiene:**
 - Set large temporaries to `$null` between phases (`$batches = $null` after Phase 3 completes).
 - `Remove-Variable` for the GUID maps and caches at end of script.
-- Stream the detail CSV — never build it as a single in-memory string.
+- **Stream-and-write per ACE** (Phase 6): expand-and-write per ACE rather than building the full expanded list in memory. Pivot accumulates aggregates as detail rows are emitted, avoiding a second pass and keeping peak memory bounded at the aggregate state size (~5k trustees × few KB ≈ ~5 MB).
+
+**Phase 6 streaming pattern:**
+```
+$detailWriter = [StreamWriter]::new($detailPath, $false, [Text.Encoding]::UTF8)
+$detailWriter.WriteLine($DETAIL_HEADER)
+$pivotStats = [Dictionary[string, PSObject]]::new()
+
+foreach ($ace in $AceRecords) {
+    $effective = Resolve-EffectiveTrustees $ace      # expand groups (Phase 4 cache)
+    foreach ($et in $effective) {
+        Write-DetailRow -Writer $detailWriter -Ace $ace -EffectiveTrustee $et
+        Update-PivotAggregate -Stats $pivotStats -EffectiveTrustee $et -Ace $ace
+    }
+}
+$detailWriter.Flush(); $detailWriter.Dispose()
+
+# Pivot is now ready in $pivotStats — no second pass over $AceRecords needed
+Write-PivotCsv -Path $pivotPath -Stats $pivotStats
+```
+
+This caps detail-side peak memory at the size of `$AceRecords` (pre-expansion ~360 MB) rather than 5M expanded rows × ~400 bytes ≈ ~2 GB.
 
 **Early exits:** If any NC returns zero objects, log and skip. If the GUID maps are empty (corrupt schema or insufficient rights), throw — this is unrecoverable per house style.
 
@@ -378,19 +496,21 @@ $pool.Close(); $pool.Dispose()
 
 ## 13. Logging (JSONL)
 
-Compatible with existing `Write-Log` / Write-Log JSONL convention. One event per line. Required fields: `timestamp`, `level`, `phase`, `event`, `message`. Optional: `data` (nested object), `correlationId`.
+Implemented by `Write-LogEvent` (named to satisfy `PSUseApprovedVerbs` — `Log` is not an approved PowerShell verb). One event per line. Required fields: `timestamp` (ISO-8601 UTC), `level`, `phase`, `event`, `message`. Optional: `data` (nested object), `correlationId`.
 
 **Events to emit (and only these — no per-object logging):**
 - `ScriptStart` (params summary)
 - `PhaseStart` / `PhaseEnd` for each of the 6 phases (with counts and elapsed ms in `data`)
 - `NamingContextDiscovered` (one per NC)
-- `MapBuilt` (extended rights count, schema GUID count)
+- `MapBuilt` (extended rights count, schema GUID count, property-set count)
 - `EnumerationProgress` (every N batches, e.g., every 5000 objects)
 - `OrphanSid` (one per distinct orphan)
-- `BatchError` (per-batch parse failures from runspaces)
+- `BatchError` (per-batch parse failures from runspaces; also `InheritedAceOnProtectedDacl` per §9 inconsistency check)
 - `ScriptEnd` (totals, elapsed, output paths)
 
 Levels: `INFO`, `WARN`, `ERROR`. No `DEBUG` chatter at default verbosity.
+
+**Console progress:** for the enumeration phase (potentially minutes-long on a 30k-object domain), emit `Write-Progress` ticks at the same cadence as `EnumerationProgress` JSONL events: per-NC percentage complete, current batch index, elapsed time. Do NOT use `Write-Host` (PSScriptAnalyzer rule `PSAvoidUsingWriteHost`). `Write-Progress` is the correct stream for interactive progress and is suppressed cleanly in non-interactive runs.
 
 ---
 
@@ -412,14 +532,27 @@ Per house style: throw only on unrecoverable, otherwise capture/log/continue.
 
 All caught errors append to `$ErrorBag`. Final `ScriptEnd` log event includes `errorCount`.
 
+**Exit codes (for CLI / CI consumers):**
+
+| Code | Meaning |
+|---|---|
+| 0 | Success — `errorCount = 0` |
+| 1 | Unrecoverable error — LDAP bind, RootDSE read, schema/extended-rights query empty, CSV write failure |
+| 2 | Success-with-warnings — `errorCount > 0` (partial inventory written; check log to see which objects failed) |
+
+Implemented via `try`/`catch` at top level: re-throw unrecoverable errors (PowerShell surfaces these as exit 1 by default, but explicit `exit 1` in the top-level catch makes it deterministic). At end of script: `if ($ErrorBag.Count -gt 0) { exit 2 } else { exit 0 }`.
+
 ---
 
 ## 15. Dependencies
 
 **Required:**
+- **Operating system: Windows.** PowerShell 7+ on Windows. Required for `System.DirectoryServices.ActiveDirectorySecurity` parsing and `NTAccount.Translate()` SID resolution. Linux/macOS PowerShell 7 will load the type but fail at the parsing step — the script is Windows-only. (Verified empirically via CI: Ubuntu test job failed; switched to `windows-latest`.) Add to script header: `# Windows-only — uses System.DirectoryServices types not available on .NET on Linux/macOS.`
 - PowerShell 7+
 - .NET assemblies (built-in): `System.DirectoryServices`, `System.DirectoryServices.Protocols`, `System.Security.Principal`
-- Network reachability to a writable DC for the target domain
+- Network reachability to a writable DC for the target domain on **port 389** (LDAP). Port 9389 (ADWS) is NOT used.
+
+**Authentication:** Kerberos (Negotiate) only — `LdapConnection.AuthType = AuthType.Negotiate`. NTLM fallback within Negotiate is acceptable. LDAPS (port 636) and Basic auth are not supported in v1.
 
 **Optional / not used:**
 - `ActiveDirectory` PowerShell module — **not required**. The script uses S.DS.P directly for performance and to avoid the module's per-call overhead. If a function genuinely benefits from it (e.g., a fallback `Get-ADObject` for niche resolution), gate behind a capability check — do not hard-require.
@@ -434,9 +567,9 @@ All caught errors append to `$ErrorBag`. Final `ScriptEnd` log event includes `e
 
 These were not raised during planning. Implementation may proceed with the noted defaults, but flag them at the top of the script header so future maintainers see them.
 
-1. **ACE deduplication for identical inherited ACEs from the same source** — when two parent containers contribute the same logical ACE to a descendant (rare but possible with explicit ACE replication), do we emit two rows or one with merged source DNs? **Default:** emit one row per logical ACE, with `InheritanceSourceDN` set to the deepest match.
+1. **ACE deduplication for identical inherited ACEs from the same source** — when two parent containers contribute the same logical ACE to a descendant (rare but possible with explicit ACE replication), do we emit two rows or one with merged source DNs? **Default:** emit one row per logical ACE, with `InheritanceSourceDN` set to the nearest match (per §9 algorithm).
 2. **Deny ACE precedence** — the report includes both Allow and Deny ACEs but does not compute *effective* access (which would require resolving Allow/Deny conflicts per Windows access-check semantics). Inventory only.
-3. **"Domain Users" / "Authenticated Users" expansion** — these resolve to enormous implicit member sets. **Default:** do not transitively expand these well-known groups; treat as terminal trustees and flag with `EffectiveTrusteeName = AceTrusteeName`. Configurable via a future flag if needed; for now, hard-coded skip list documented in help.
+3. **Well-known trustee expansion** — well-known SIDs (Domain Users, Authenticated Users, Everyone, etc.) and BUILTIN aliases are treated as terminal trustees and not transitively expanded. The full skip list is enumerated in §10. Configurable via a future flag if needed.
 4. **Tombstoned object handling** — deleted-objects container is *not* enumerated by default. Confirm this is desired.
 
 ---
@@ -450,6 +583,9 @@ Not full Pester coverage (out of scope per "pure inventory snapshot"), but the i
 3. Verify an inherited default schema ACE (e.g., on a fresh user object) is captured with `IsInherited = true` and either a resolved `InheritanceSourceDN` or `SchemaDefaultOrUnresolved`.
 4. Verify pivot row counts reconcile with detail row aggregates.
 5. Run on a 30k-object domain and confirm completion within an acceptable window (target: < 30 minutes on an 8-core admin workstation; not a hard SLA).
+6. **Property-set decoding:** grant a known property-set ACE (e.g., `WriteProperty` on the `Phone-and-Mail-Options` property set on a test user) and verify: `ObjectTypeKind = 'PropertySet'`, `ObjectTypeName = 'Phone-and-Mail-Options'`, and the log shows the member attributes resolved from `PropertySetMembersMap`.
+7. **Owner capture:** set the owner of a test OU to a known principal (e.g., `Test-Owner-User`) and verify a row appears in detail CSV with `AceType = 'Synthetic.Owner'`, `AceTrusteeSid = <Test-Owner-User SID>`, `RightsDecoded = 'OwnerImplicit'`, and `AceIndex = -1`.
+8. **DACL_PROTECTED:** create a test OU with DACL inheritance disabled (Properties → Security → Advanced → Disable inheritance → Convert) and verify all rows for that OU show `IsDaclProtected = $true` and that none have `IsInherited = $true`. Log should NOT contain `InheritedAceOnProtectedDacl` for this OU (a clean test case).
 
 ---
 
@@ -457,15 +593,28 @@ Not full Pester coverage (out of scope per "pure inventory snapshot"), but the i
 
 Build in this sequence so each phase is independently testable:
 
-1. Parameters + script skeleton + `Write-Log`
-2. Phase 1: NC discovery + GUID maps (testable standalone)
-3. Phase 2: Enumeration (testable: count objects per NC)
-4. Phase 3: ACE parsing — first single-threaded, then wrap in runspace pool
-5. Phase 4: Trustee resolution + group expansion (testable: known group SID → expected member list)
-6. Phase 5: Inheritance source resolution
-7. Phase 6: Detail CSV writer (streaming)
-8. Phase 6: Pivot CSV writer
+1. Parameters + script skeleton + `Write-LogEvent`
+2. Phase 1: NC discovery + GUID maps — `ExtendedRightsMap`, `SchemaGuidMap`, `PropertySetMembersMap` (testable standalone)
+3. Phase 2: Enumeration with `SecurityDescriptorFlagControl(OWNER | DACL)` (testable: count objects per NC)
+4. Phase 3: SD parsing (`ConvertFrom-NtSecurityDescriptor` returns Owner + DACL + IsDaclProtected) and ACE parsing including synthetic `Add-OwnerAce` — first single-threaded, then wrap in runspace pool
+5. Phase 4: Trustee resolution + group expansion + well-known SID skip list (testable: known group SID → expected member list; well-known group → terminal)
+6. Phase 5: Inheritance source resolution with composite-key index + DACL_PROTECTED short-circuit
+7. Phase 6: Detail CSV writer (streaming, with `AceIndex` and `IsDaclProtected` columns and `Synthetic.Owner` rows)
+8. Phase 6: Pivot CSV writer (built incrementally during detail streaming via `$PivotStats`)
 9. End-to-end smoke run on lab domain
 10. Performance pass (only if needed) on 30k-object domain
 
 Do not skip ahead. Each phase commits independently.
+
+### Step ↔ smoke-test scenario mapping (§17)
+
+| Step                                                    | Scenarios it satisfies               |
+|---------------------------------------------------------|--------------------------------------|
+| 4 (ACE parsing single-thread + Owner + DACL_PROTECTED)  | 1, 6, 7, 8                          |
+| 5 (Trustee resolution + group expansion)                | 2                                    |
+| 6 (Inheritance source)                                  | 3                                    |
+| 7 (Detail CSV writer)                                   | 1, 2, 3, 6, 7, 8 — column verification |
+| 8 (Pivot CSV writer)                                    | 4 (pivot reconciles with detail aggregates) |
+| 10 (Performance pass)                                   | 5 (30k-object completion within window) |
+
+This mapping makes coverage incremental: by step 7 the implementation has end-to-end coverage of seven of the eight smoke scenarios; only the perf scenario remains.
