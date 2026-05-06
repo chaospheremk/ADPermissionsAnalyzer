@@ -8,8 +8,7 @@
 
     # ScanPaths feeds Lint; CoveragePaths feeds Pester code coverage.
     # TODO: extend with the analyzer script paths once defined (see docs/AD-Permissions-Analyzer-Plan.md §18).
-    # 'scripts' currently covers only Install-GitHooks.ps1 — adequate as a starting point.
-    ScanPaths         = @('scripts')
+    ScanPaths         = @('scripts', 'Export-ScriptDocumentation.ps1')
     CoveragePaths     = @('scripts')
 
     CoverageThreshold = 50
