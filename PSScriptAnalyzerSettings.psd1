@@ -19,7 +19,7 @@
         # Test files use ConvertTo-SecureString -AsPlainText for mock credentials.
         'PSAvoidUsingConvertToSecureStringWithPlainText'
 
-        # CUSTOMIZATION: Add project-specific exclusions below with a comment
-        # explaining why the exclusion is needed.
+        # Add project-specific exclusions below with a comment explaining why.
+        # (none yet)
     )
 }
