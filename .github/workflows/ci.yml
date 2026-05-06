@@ -1,6 +1,4 @@
-# Standardized CI workflow for PowerShell projects (Invoke-Build)
-# Copy to: code/.github/workflows/ci.yml
-# Search for "# CUSTOMIZATION:" comments and adjust for your project
+# CI workflow for ADPermissionsAnalyzer (Invoke-Build)
 #
 # Triggers on pull_request to main only — no push triggers.
 # PR trigger gates merging; push-to-dev and push-to-main are redundant.
@@ -9,10 +7,9 @@
 #   1. Pre-commit hook (first defense) — .pre-commit-config.yaml
 #   2. CI TruffleHog scan (backstop) — secret-scan job below
 #
-# Jobs: changes → lint → test → docs-check → secret-scan → ci-gate
-# CUSTOMIZATION: For standalone script projects without PlatyPS,
-# remove the docs-check job and remove it from ci-gate needs array.
-# CUSTOMIZATION: Uncomment bicep-validate if project has IaC.
+# Jobs: changes → lint → test → secret-scan → ci-gate
+# Note: no docs-check job — this is a standalone script project, not a PlatyPS module.
+# Note: no bicep-validate job — no IaC in scope.
 
 name: CI
 
@@ -31,21 +28,15 @@ jobs:
       pull-requests: read
     outputs:
       powershell: ${{ steps.filter.outputs.powershell }}
-      # CUSTOMIZATION: Add additional outputs if needed (e.g., bicep)
-      # bicep: ${{ steps.filter.outputs.bicep }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: dorny/paths-filter@v4
         id: filter
         with:
-          # CUSTOMIZATION: Adjust path patterns to match your project layout.
-          # Broad wildcards work for most projects. For large repos, narrow to
-          # specific directories (e.g., 'Public/**', 'Private/**', 'Tests/**').
           filters: |
             powershell:
               - '**/*.ps1'
-              - '**/*.psm1'
               - '**/*.psd1'
               - 'PSScriptAnalyzerSettings.psd1'
               - '*.build.ps1'
@@ -57,8 +48,7 @@ jobs:
     needs: changes
     if: github.actor != 'claude[bot]' && needs.changes.outputs.powershell == 'true'
     runs-on: ubuntu-latest
-    # CUSTOMIZATION: Use windows-latest if your module requires Windows-only
-    # features (DPAPI, Cert:\, COM objects) for import during lint.
+    # Lint runs PSScriptAnalyzer (AST-only, no module import) — ubuntu is fine.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -73,8 +63,6 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.local/share/powershell/Modules
-          # CUSTOMIZATION: Change cache path to ~/Documents/PowerShell/Modules
-          # if using windows-latest runner.
           key: ps-lint-${{ steps.week.outputs.week }}-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ps-lint-
@@ -96,8 +84,9 @@ jobs:
     name: Pester Tests
     needs: changes
     if: github.actor != 'claude[bot]' && needs.changes.outputs.powershell == 'true'
-    runs-on: ubuntu-latest
-    # CUSTOMIZATION: Use windows-latest if tests require Windows-only features.
+    runs-on: windows-latest
+    # Windows runner required: System.DirectoryServices.ActiveDirectorySecurity
+    # (used for ACE parsing) is Windows-only on .NET 5+.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -107,12 +96,15 @@ jobs:
 
       - name: Get cache week
         id: week
-        run: echo "week=$(date +%Y-W%V)" >> $GITHUB_OUTPUT
+        shell: pwsh
+        run: |
+          $week = (Get-Date -UFormat '%Y-W%V')
+          "week=$week" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Cache PowerShell modules
         uses: actions/cache@v5
         with:
-          path: ~/.local/share/powershell/Modules
+          path: ~/Documents/PowerShell/Modules
           key: ps-test-${{ steps.week.outputs.week }}-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: |
             ps-test-
@@ -135,15 +127,12 @@ jobs:
               }
           }
 
-          # CUSTOMIZATION: Install additional module dependencies here if your
-          # tests require them (e.g., stub modules for ActiveDirectory, Az.*).
-
       - name: Run tests
         shell: pwsh
         run: Invoke-Build Test -Configuration Release
 
       - name: Publish test results
-        if: always()
+        if: always() && hashFiles('TestResults.xml') != ''
         uses: dorny/test-reporter@v3
         with:
           name: Pester Tests
@@ -151,61 +140,18 @@ jobs:
           reporter: java-junit
 
       - name: Upload test results
-        if: always()
+        if: always() && hashFiles('TestResults.xml') != ''
         uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: TestResults.xml
 
       - name: Upload coverage results
-        if: always()
+        if: always() && hashFiles('CoverageResults.xml') != ''
         uses: actions/upload-artifact@v7
         with:
           name: coverage-results
           path: CoverageResults.xml
-
-  docs-check:
-    name: Docs Verification
-    needs: changes
-    if: github.actor != 'claude[bot]' && needs.changes.outputs.powershell == 'true'
-    runs-on: ubuntu-latest
-    # CUSTOMIZATION: Use windows-latest if module import requires Windows features.
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Get cache week
-        id: week
-        run: echo "week=$(date +%Y-W%V)" >> $GITHUB_OUTPUT
-
-      - name: Cache PowerShell modules
-        uses: actions/cache@v5
-        with:
-          path: ~/.local/share/powershell/Modules
-          key: ps-docs-${{ steps.week.outputs.week }}-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ps-docs-
-
-      - name: Install build dependencies
-        shell: pwsh
-        run: |
-          foreach ($mod in @('InvokeBuild')) {
-              if (-not (Get-Module -ListAvailable -Name $mod)) {
-                  Install-Module -Name $mod -Force -Scope CurrentUser
-              }
-          }
-          if (-not (Get-Module -ListAvailable -Name Microsoft.PowerShell.PlatyPS)) {
-              Install-PSResource -Name Microsoft.PowerShell.PlatyPS -Scope CurrentUser -TrustRepository
-          }
-
-          # CUSTOMIZATION: Install additional module dependencies here if your
-          # module requires them for Import-Module during doc generation.
-
-      - name: Assert docs are current
-        shell: pwsh
-        run: Invoke-Build AssertDocsClean
 
   secret-scan:
     name: Secret Scan
@@ -222,34 +168,10 @@ jobs:
         with:
           extra_args: --only-verified
 
-  # CUSTOMIZATION: Uncomment for projects with Bicep IaC
-  # bicep-validate:
-  #   name: Bicep Validate
-  #   needs: changes
-  #   if: github.actor != 'claude[bot]' && needs.changes.outputs.bicep == 'true'
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 15
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #
-  #     - name: Install Bicep CLI
-  #       run: |
-  #         curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
-  #         chmod +x bicep
-  #         sudo mv bicep /usr/local/bin/bicep
-  #
-  #     - name: Validate Bicep syntax
-  #       run: bicep build Infrastructure/main.bicep --outfile /dev/null
-  #
-  #     - name: Validate Bicep parameter file
-  #       run: bicep build-params Infrastructure/main.bicepparam --outfile /dev/null
-
   ci-gate:
     name: CI Gate
     if: always() && github.actor != 'claude[bot]'
-    needs: [lint, test, docs-check, secret-scan]
-    # CUSTOMIZATION: Add bicep-validate to needs array if using Bicep job.
-    # CUSTOMIZATION: Remove docs-check from needs array for script-only projects.
+    needs: [lint, test, secret-scan]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -257,7 +179,6 @@ jobs:
         run: |
           if [[ "${{ needs.lint.result }}" == "failure" || \
                 "${{ needs.test.result }}" == "failure" || \
-                "${{ needs.docs-check.result }}" == "failure" || \
                 "${{ needs.secret-scan.result }}" == "failure" ]]; then
             echo "One or more CI jobs failed"
             exit 1

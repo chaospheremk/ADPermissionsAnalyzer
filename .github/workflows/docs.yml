@@ -1,10 +1,7 @@
 # Standalone script documentation workflow — AST parser + Zensical
 # Uses Export-ScriptDocumentation.ps1 (AST-based) instead of PlatyPS.
-# For projects that are standalone .ps1 scripts, not .psm1/.psd1 modules.
 #
 # docs/commands/ is gitignored — generated fresh in CI.
-#
-# The scaffold replaces <ProjectName> with the actual project name.
 
 name: Publish Docs
 
@@ -43,11 +40,13 @@ jobs:
       - name: Generate script documentation
         shell: pwsh
         run: |
-          ./Export-ScriptDocumentation.ps1 `
-              -ScriptPath . `
-              -OutputPath ./docs/commands `
-              -ProjectName '<ProjectName>' `
-              -ProjectDescription '<One-line project description>'
+          $params = @{
+              ScriptPath         = '.'
+              OutputPath         = './docs/commands'
+              ProjectName        = 'ADPermissionsAnalyzer'
+              ProjectDescription = 'Comprehensive DACL ACE inventory across all AD naming contexts for least-privilege analysis.'
+          }
+          ./Export-ScriptDocumentation.ps1 @params
 
       - name: Set up Python
         uses: actions/setup-python@v6
