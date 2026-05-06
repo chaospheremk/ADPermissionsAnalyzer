@@ -132,7 +132,7 @@ jobs:
         run: Invoke-Build Test -Configuration Release
 
       - name: Publish test results
-        if: always()
+        if: always() && hashFiles('TestResults.xml') != ''
         uses: dorny/test-reporter@v3
         with:
           name: Pester Tests
@@ -140,14 +140,14 @@ jobs:
           reporter: java-junit
 
       - name: Upload test results
-        if: always()
+        if: always() && hashFiles('TestResults.xml') != ''
         uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: TestResults.xml
 
       - name: Upload coverage results
-        if: always()
+        if: always() && hashFiles('CoverageResults.xml') != ''
         uses: actions/upload-artifact@v7
         with:
           name: coverage-results
