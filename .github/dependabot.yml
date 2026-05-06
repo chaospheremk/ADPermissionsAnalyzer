@@ -1,0 +1,21 @@
+# Dependabot configuration for automated dependency updates
+# Copy to: code/.github/dependabot.yml
+#
+# Creates PRs automatically when new versions of GitHub Actions or
+# Python packages are available. PRs target the default branch (main).
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"

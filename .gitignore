@@ -1,0 +1,42 @@
+# PowerShell
+*.dll
+*.pdb
+
+# Test and coverage artifacts
+TestResults.xml
+CoverageResults.xml
+coverage.xml
+
+# Invoke-Build output
+output/
+
+# Zensical build output
+site/
+
+# Generated documentation — standalone scripts only (Export-ScriptDocumentation, rebuilt in CI)
+# Module docs (docs/commands/) are committed and verified by AssertDocsClean in CI
+
+# PlatyPS backup files
+*.bak
+
+# MAML generated help (built in CI, not committed)
+en-US/
+
+# Python virtual environment (Zensical)
+.venv/
+__pycache__/
+
+# Claude Code
+.claude/
+
+# Serena MCP developer-specific memories
+.serena/
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# IDE
+.vscode/settings.json
+.idea/

@@ -1,0 +1,71 @@
+# Standalone script documentation workflow — AST parser + Zensical
+# Uses Export-ScriptDocumentation.ps1 (AST-based) instead of PlatyPS.
+# For projects that are standalone .ps1 scripts, not .psm1/.psd1 modules.
+#
+# docs/commands/ is gitignored — generated fresh in CI.
+#
+# The scaffold replaces <ProjectName> with the actual project name.
+
+name: Publish Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements.txt'
+      - '**/*.ps1'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate script documentation
+        shell: pwsh
+        run: |
+          ./Export-ScriptDocumentation.ps1 `
+              -ScriptPath . `
+              -OutputPath ./docs/commands `
+              -ProjectName '<ProjectName>' `
+              -ProjectDescription '<One-line project description>'
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Zensical
+        run: pip install -r requirements.txt
+
+      - name: Build site
+        run: zensical build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
