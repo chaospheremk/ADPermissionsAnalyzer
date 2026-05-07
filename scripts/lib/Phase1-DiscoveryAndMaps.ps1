@@ -69,25 +69,27 @@ function Connect-AdLdap {
     , $connection
 }
 
-function Invoke-PagedLdapSearch {
+function Read-LdapEntry {
     <#
     .SYNOPSIS
-        Run a paged subtree LDAP search and return all entries normalised to
-        plain hashtables.
+        Stream entries from a paged LDAP search to the pipeline as plain
+        hashtables. Phase 2's Get-ADObjectAclBatch and Phase 1's
+        Invoke-PagedLdapSearch (a materialising wrapper) both build on this.
 
     .DESCRIPTION
-        Wraps SearchRequest + PageResultRequestControl. Each returned entry is a
-        hashtable with keys DistinguishedName (string) and Attributes
+        Wraps SearchRequest + PageResultRequestControl. Each entry is emitted
+        as a hashtable with keys DistinguishedName (string) and Attributes
         (hashtable name -> values). Values for attributes named in
-        -BinaryAttributes are extracted as byte[][]; all others are extracted
-        as string[]. This is the single IO boundary for Phase 1, so unit tests
-        mock it to feed synthetic entries to the map builders.
+        -BinaryAttributes are extracted as byte[][]; all others as string[].
+        Optional -AdditionalControls are appended to the SearchRequest so
+        callers can attach controls such as SecurityDescriptorFlagControl
+        (Phase 2) without duplicating the page loop.
 
     .PARAMETER Connection
-        Already-bound LdapConnection. Untyped at the parameter level so unit
-        tests can mock this function without instantiating a real
-        [LdapConnection] (whose constructor binds eagerly and fails offline).
-        Production callers always pass a real LdapConnection.
+        Already-bound LdapConnection. Untyped so unit tests can mock the
+        function without constructing a real connection (the constructor
+        binds eagerly and fails offline). Production callers always pass a
+        real LdapConnection.
 
     .PARAMETER SearchBase
         Base DN to search from.
@@ -99,12 +101,123 @@ function Invoke-PagedLdapSearch {
         Attribute names to retrieve.
 
     .PARAMETER BinaryAttributes
-        Subset of -Attributes that should be returned as byte[][] rather than
-        string[]. Used for octet-string attributes (schemaIDGUID,
-        attributeSecurityGUID, etc).
+        Subset of -Attributes returned as byte[][] rather than string[].
+
+    .PARAMETER AdditionalControls
+        Extra DirectoryControls appended after the paging control. Used by
+        Phase 2 to attach SecurityDescriptorFlagControl(OWNER | DACL).
 
     .PARAMETER PageSize
         LDAP page size. Default 1000 (the AD server-side cap).
+
+    .PARAMETER Scope
+        Search scope. Default Subtree.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        $Connection,
+
+        [Parameter(Mandatory)]
+        [string] $SearchBase,
+
+        [Parameter(Mandatory)]
+        [string] $Filter,
+
+        [Parameter(Mandatory)]
+        [string[]] $Attributes,
+
+        [Parameter()]
+        [string[]] $BinaryAttributes = @(),
+
+        [Parameter()]
+        [DirectoryControl[]] $AdditionalControls = @(),
+
+        [Parameter()]
+        [ValidateRange(1, 5000)]
+        [int] $PageSize = 1000,
+
+        [Parameter()]
+        [SearchScope] $Scope = [SearchScope]::Subtree
+    )
+
+    $request     = [SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
+    $pageControl = [PageResultRequestControl]::new($PageSize)
+    [void] $request.Controls.Add($pageControl)
+    foreach ($ctrl in $AdditionalControls) {
+        [void] $request.Controls.Add($ctrl)
+    }
+
+    $binarySet = [HashSet[string]]::new(
+        [string[]] $BinaryAttributes,
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    while ($true) {
+        $response = [SearchResponse] $Connection.SendRequest($request)
+
+        foreach ($entry in $response.Entries) {
+            $attrs = @{}
+            foreach ($name in $entry.Attributes.AttributeNames) {
+                $attr = $entry.Attributes[$name]
+                $attrs[$name] = if ($binarySet.Contains($name)) {
+                    $attr.GetValues([byte[]])
+                }
+                else {
+                    $attr.GetValues([string])
+                }
+            }
+            @{
+                DistinguishedName = $entry.DistinguishedName
+                Attributes        = $attrs
+            }
+        }
+
+        $pageResp = $null
+        foreach ($control in $response.Controls) {
+            if ($control -is [PageResultResponseControl]) {
+                $pageResp = $control
+                break
+            }
+        }
+        if ($null -eq $pageResp -or $pageResp.Cookie.Length -eq 0) {
+            break
+        }
+        $pageControl.Cookie = $pageResp.Cookie
+    }
+}
+
+function Invoke-PagedLdapSearch {
+    <#
+    .SYNOPSIS
+        Materialising wrapper around Read-LdapEntry: returns a
+        List[hashtable] of every entry from a paged subtree search.
+
+    .DESCRIPTION
+        Phase 1 callers (the GUID-map builders) want the full result set as a
+        list. Phase 2 streams via Read-LdapEntry directly. Mocked at this
+        boundary by the Phase 1 unit tests so map builders can be exercised
+        without a live DC.
+
+    .PARAMETER Connection
+        Already-bound LdapConnection (typing relaxed for mockability — see
+        Read-LdapEntry).
+
+    .PARAMETER SearchBase
+        Base DN to search from.
+
+    .PARAMETER Filter
+        LDAP search filter.
+
+    .PARAMETER Attributes
+        Attribute names to retrieve.
+
+    .PARAMETER BinaryAttributes
+        Subset of -Attributes returned as byte[][].
+
+    .PARAMETER PageSize
+        LDAP page size. Default 1000.
 
     .PARAMETER Scope
         Search scope. Default Subtree.
@@ -136,48 +249,10 @@ function Invoke-PagedLdapSearch {
         [SearchScope] $Scope = [SearchScope]::Subtree
     )
 
-    $results     = [List[hashtable]]::new()
-    $request     = [SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
-    $pageControl = [PageResultRequestControl]::new($PageSize)
-    [void] $request.Controls.Add($pageControl)
-
-    $binarySet = [HashSet[string]]::new(
-        [string[]] $BinaryAttributes,
-        [System.StringComparer]::OrdinalIgnoreCase)
-
-    while ($true) {
-        $response = [SearchResponse] $Connection.SendRequest($request)
-
-        foreach ($entry in $response.Entries) {
-            $attrs = @{}
-            foreach ($name in $entry.Attributes.AttributeNames) {
-                $attr = $entry.Attributes[$name]
-                $attrs[$name] = if ($binarySet.Contains($name)) {
-                    $attr.GetValues([byte[]])
-                }
-                else {
-                    $attr.GetValues([string])
-                }
-            }
-            $results.Add(@{
-                DistinguishedName = $entry.DistinguishedName
-                Attributes        = $attrs
-            })
-        }
-
-        $pageResp = $null
-        foreach ($control in $response.Controls) {
-            if ($control -is [PageResultResponseControl]) {
-                $pageResp = $control
-                break
-            }
-        }
-        if ($null -eq $pageResp -or $pageResp.Cookie.Length -eq 0) {
-            break
-        }
-        $pageControl.Cookie = $pageResp.Cookie
+    $results = [List[hashtable]]::new()
+    foreach ($entry in (Read-LdapEntry @PSBoundParameters)) {
+        $results.Add($entry)
     }
-
     , $results
 }
 

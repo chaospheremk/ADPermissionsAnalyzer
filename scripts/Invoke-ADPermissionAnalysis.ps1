@@ -139,6 +139,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1')
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -345,8 +346,105 @@ try {
     Write-LogEvent @phase1EndParams
 
     # --- Phase 2: Object enumeration ---------------------------------------
-    # TODO(plan §18.3): Get-ADObjectAclBatch (paged S.DS.Protocols search with
-    #                   SecurityDescriptorFlagControl(OWNER | DACL)).
+    $phase2Start = [DateTime]::UtcNow
+    $phase2StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase2'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 2: object enumeration.'
+    }
+    Write-LogEvent @phase2StartParams
+
+    $selectedNcs = $namingContexts.Where({ $_.Type -in $IncludeNamingContexts })
+    $progressIntervalObjects = 5000
+    $totalObjects = 0
+
+    # Phase 3 (Step 4) will hook into the per-batch foreach below to dispatch
+    # to the runspace pool. For now we only count and emit progress.
+    foreach ($nc in $selectedNcs) {
+        $ncStart           = [DateTime]::UtcNow
+        $ncObjectCount     = 0
+        $sinceLastProgress = 0
+
+        $batchParams = @{
+            Connection = $script:LdapConnection
+            SearchBase = $nc.DistinguishedName
+            BatchSize  = $BatchSize
+            PageSize   = $PageSize
+        }
+
+        foreach ($batch in Get-ADObjectAclBatch @batchParams) {
+            $ncObjectCount     += $batch.Count
+            $totalObjects      += $batch.Count
+            $sinceLastProgress += $batch.Count
+            # TODO(Step 4): dispatch $batch to the Phase 3 runspace pool.
+
+            if ($sinceLastProgress -ge $progressIntervalObjects) {
+                $progressParams = @{
+                    Level     = 'INFO'
+                    Phase     = 'Phase2'
+                    EventName = 'EnumerationProgress'
+                    Message   = "Enumerated $ncObjectCount objects in $($nc.DistinguishedName)."
+                    Data      = @{
+                        namingContext = $nc.DistinguishedName
+                        ncObjectCount = $ncObjectCount
+                        totalObjects  = $totalObjects
+                    }
+                }
+                Write-LogEvent @progressParams
+
+                $writeProgressParams = @{
+                    Activity         = 'AD Permissions Analyzer - Phase 2'
+                    Status           = "$($nc.DistinguishedName): $ncObjectCount objects"
+                    CurrentOperation = "Total enumerated: $totalObjects"
+                }
+                Write-Progress @writeProgressParams
+
+                $sinceLastProgress = 0
+            }
+        }
+
+        $ncElapsedMs = [int] ([DateTime]::UtcNow - $ncStart).TotalMilliseconds
+        $ncCompleteParams = @{
+            Level     = 'INFO'
+            Phase     = 'Phase2'
+            EventName = 'NamingContextComplete'
+            Message   = "Naming context $($nc.DistinguishedName) enumerated."
+            Data      = @{
+                namingContext = $nc.DistinguishedName
+                objectCount   = $ncObjectCount
+                elapsedMs     = $ncElapsedMs
+            }
+        }
+        Write-LogEvent @ncCompleteParams
+
+        if ($ncObjectCount -eq 0) {
+            $emptyParams = @{
+                Level     = 'WARN'
+                Phase     = 'Phase2'
+                EventName = 'EmptyNamingContext'
+                Message   = "Naming context $($nc.DistinguishedName) returned no objects."
+                Data      = @{ namingContext = $nc.DistinguishedName }
+            }
+            Write-LogEvent @emptyParams
+        }
+    }
+
+    Write-Progress -Activity 'AD Permissions Analyzer - Phase 2' -Completed
+
+    $phase2ElapsedMs = [int] ([DateTime]::UtcNow - $phase2Start).TotalMilliseconds
+    $phase2EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase2'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 2 complete.'
+        Data      = @{
+            totalObjects             = $totalObjects
+            namingContextsEnumerated = $selectedNcs.Count
+            elapsedMs                = $phase2ElapsedMs
+        }
+    }
+    Write-LogEvent @phase2EndParams
 
     # --- Phase 3: ACE parsing (runspace pool) ------------------------------
     # TODO(plan §18.4): ConvertFrom-NtSecurityDescriptor, Add-OwnerAce,
