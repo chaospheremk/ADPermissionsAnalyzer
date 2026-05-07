@@ -1,0 +1,331 @@
+#Requires -Version 7.0
+using namespace System.Collections.Generic
+using namespace System.IO
+using namespace System.Text
+
+<#
+.SYNOPSIS
+    Produces a comprehensive inventory of every DACL ACE on every object in a single
+    Active Directory domain, across all naming contexts, for least-privilege analysis.
+
+.DESCRIPTION
+    Skeleton entry point for the AD Permissions Analyzer.
+
+    This step (plan §18.1) wires the parameter surface, the JSONL logging primitive,
+    and the top-level execution skeleton. Subsequent steps (§18.2-§18.8) populate the
+    six phases: discovery + GUID maps, enumeration, ACE parsing, trustee resolution,
+    inheritance source resolution, and CSV output.
+
+    The full implementation specification is in
+    docs/AD-Permissions-Analyzer-Plan.md. House style (foreach, .Where({}), typed
+    collections, CmdletBinding, structured JSONL logging, no Set-StrictMode, no
+    ForEach-Object, no Where-Object) is mandatory throughout.
+
+.PARAMETER Domain
+    FQDN of the target domain. Default: the current user's domain (resolved at runtime).
+
+.PARAMETER Server
+    Specific domain controller to bind to. Default: DC locator.
+
+.PARAMETER Credential
+    Credential to use for the LDAP bind. Default: current process identity.
+
+.PARAMETER OutputDirectory
+    Directory where the detail CSV, pivot CSV, and JSONL log are written. Created if
+    it does not exist.
+
+.PARAMETER DetailFileName
+    Filename for the per-ACE detail CSV. Default: ADPermissions_Detail_<UTC timestamp>.csv
+
+.PARAMETER PivotFileName
+    Filename for the per-trustee pivot CSV. Default: ADPermissions_Pivot_<UTC timestamp>.csv
+
+.PARAMETER LogFileName
+    Filename for the structured JSONL log. Default: ADPermissions_<UTC timestamp>.jsonl
+
+.PARAMETER BatchSize
+    Number of objects per runspace work unit during phase 3 ACE parsing. Default: 250.
+
+.PARAMETER ThreadCount
+    Number of runspaces in the pool. Default: [Environment]::ProcessorCount. Values
+    above 16 typically waste effort because LDAP becomes the bottleneck.
+
+.PARAMETER PageSize
+    LDAP paged-search page size. Default: 1000 (the AD server-side cap).
+
+.PARAMETER IncludeNamingContexts
+    Naming contexts to enumerate. Default: Domain, Configuration, Schema, DNS.
+
+.PARAMETER SkipTransitiveExpansion
+    Escape hatch: skip transitive group expansion. Group-trustee ACEs are emitted with
+    the group as the effective trustee. Default: off.
+
+.EXAMPLE
+    .\Invoke-ADPermissionAnalysis.ps1 -OutputDirectory C:\AdPermAudit
+
+    Run against the current domain with default settings.
+
+.EXAMPLE
+    $params = @{
+        Domain                = '<domain.fqdn>'
+        Server                = '<dc-fqdn>'
+        OutputDirectory       = 'C:\AdPermAudit'
+        ThreadCount           = 8
+        IncludeNamingContexts = @('Domain', 'Configuration')
+    }
+    .\Invoke-ADPermissionAnalysis.ps1 @params
+
+    Run against a specific domain and DC, with limited NCs and a fixed thread count.
+
+.NOTES
+    Windows-only. Uses System.DirectoryServices.ActiveDirectorySecurity and
+    NTAccount.Translate(); these are not available on .NET on Linux/macOS.
+
+    Permissions: read access to nTSecurityDescriptor on every enumerated object.
+    Typically Domain Admins or an explicitly delegated principal.
+
+    Specification: docs/AD-Permissions-Analyzer-Plan.md
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string] $Domain,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string] $Server,
+
+    [Parameter()]
+    [PSCredential] $Credential,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $OutputDirectory,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string] $DetailFileName,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string] $PivotFileName,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string] $LogFileName,
+
+    [Parameter()]
+    [ValidateRange(1, 10000)]
+    [int] $BatchSize = 250,
+
+    [Parameter()]
+    [ValidateRange(1, 32)]
+    [int] $ThreadCount = [Environment]::ProcessorCount,
+
+    [Parameter()]
+    [ValidateRange(100, 1000)]
+    [int] $PageSize = 1000,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string[]] $IncludeNamingContexts = @('Domain', 'Configuration', 'Schema', 'DNS'),
+
+    [Parameter()]
+    [switch] $SkipTransitiveExpansion
+)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Helpers ----------------------------------------------------------------
+
+function Write-LogEvent {
+    <#
+    .SYNOPSIS
+        Append one structured JSONL event to the script-scoped log writer.
+
+    .DESCRIPTION
+        Emits a single-line JSON record to $script:LogWriter. Required fields:
+        timestamp (ISO-8601 UTC), level, phase, event, message. Optional: data
+        (nested hashtable), correlationId. Named Write-LogEvent rather than
+        Write-Log because Log is not an approved PowerShell verb.
+
+    .PARAMETER Level
+        Severity. INFO, WARN, or ERROR.
+
+    .PARAMETER Phase
+        Phase identifier (e.g., Init, Phase1, Phase3, Complete).
+
+    .PARAMETER EventName
+        Short event name (e.g., ScriptStart, PhaseStart, OrphanSid). Serialized
+        as the JSON field "event".
+
+    .PARAMETER Message
+        Human-readable summary.
+
+    .PARAMETER Data
+        Optional nested hashtable of structured fields.
+
+    .PARAMETER CorrelationId
+        Optional correlation identifier to group related events.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string] $Level,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Phase,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $EventName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Message,
+
+        [Parameter()]
+        [hashtable] $Data,
+
+        [Parameter()]
+        [string] $CorrelationId
+    )
+
+    $entry = [ordered]@{
+        timestamp = [DateTime]::UtcNow.ToString('o')
+        level     = $Level
+        phase     = $Phase
+        event     = $EventName
+        message   = $Message
+    }
+    if ($Data)          { $entry['data']          = $Data }
+    if ($CorrelationId) { $entry['correlationId'] = $CorrelationId }
+
+    $line = $entry | ConvertTo-Json -Compress -Depth 10
+    $script:LogWriter.WriteLine($line)
+}
+
+# --- Defaults requiring runtime evaluation ----------------------------------
+
+$timestamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+if (-not $DetailFileName) { $DetailFileName = "ADPermissions_Detail_$timestamp.csv" }
+if (-not $PivotFileName)  { $PivotFileName  = "ADPermissions_Pivot_$timestamp.csv" }
+if (-not $LogFileName)    { $LogFileName    = "ADPermissions_$timestamp.jsonl" }
+
+# --- Output paths -----------------------------------------------------------
+
+if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+}
+$resolvedOutput = (Resolve-Path -LiteralPath $OutputDirectory).Path
+$logPath    = Join-Path -Path $resolvedOutput -ChildPath $LogFileName
+$detailPath = Join-Path -Path $resolvedOutput -ChildPath $DetailFileName
+$pivotPath  = Join-Path -Path $resolvedOutput -ChildPath $PivotFileName
+
+# --- Script-scoped state ----------------------------------------------------
+
+$script:LogWriter = [StreamWriter]::new($logPath, $false, [Encoding]::UTF8)
+$script:LogWriter.AutoFlush = $true
+$script:ErrorBag  = [List[PSObject]]::new()
+
+$exitCode = 0
+
+try {
+    $startData = @{
+        domain                  = $Domain
+        server                  = $Server
+        credentialProvided      = [bool]$Credential
+        outputDirectory         = $resolvedOutput
+        detailPath              = $detailPath
+        pivotPath               = $pivotPath
+        logPath                 = $logPath
+        batchSize               = $BatchSize
+        threadCount             = $ThreadCount
+        pageSize                = $PageSize
+        includeNamingContexts   = $IncludeNamingContexts
+        skipTransitiveExpansion = [bool]$SkipTransitiveExpansion
+        powerShellVersion       = $PSVersionTable.PSVersion.ToString()
+    }
+    $startParams = @{
+        Level     = 'INFO'
+        Phase     = 'Init'
+        EventName = 'ScriptStart'
+        Message   = 'AD Permissions Analyzer started.'
+        Data      = $startData
+    }
+    Write-LogEvent @startParams
+
+    # --- Phase 1: Discovery & GUID maps ------------------------------------
+    # TODO(plan §18.2): Get-ADNamingContext, New-ADExtendedRightsMap,
+    #                   New-ADSchemaGuidMap, New-PropertySetMembersMap,
+    #                   New-WellKnownSidMap.
+
+    # --- Phase 2: Object enumeration ---------------------------------------
+    # TODO(plan §18.3): Get-ADObjectAclBatch (paged S.DS.Protocols search with
+    #                   SecurityDescriptorFlagControl(OWNER | DACL)).
+
+    # --- Phase 3: ACE parsing (runspace pool) ------------------------------
+    # TODO(plan §18.4): ConvertFrom-NtSecurityDescriptor, Add-OwnerAce,
+    #                   ConvertFrom-AdAce, Invoke-AceParsingWorkUnit,
+    #                   New-RunspacePool, Invoke-RunspacePoolWork.
+
+    # --- Phase 4: Trustee resolution & group expansion ---------------------
+    # TODO(plan §18.5): Resolve-TrusteeSid, Expand-GroupTransitive,
+    #                   Get-DistinctTrusteeSet, well-known SID skip set.
+
+    # --- Phase 5: Inheritance source resolution ----------------------------
+    # TODO(plan §18.6): Resolve-InheritanceSource with composite-key index +
+    #                   DACL_PROTECTED short-circuit.
+
+    # --- Phase 6: Output (streaming) ---------------------------------------
+    # TODO(plan §18.7-8): Write-DetailCsv (StreamWriter), Write-PivotCsv from
+    #                     incrementally-built $PivotStats.
+
+    $endData = @{
+        errorCount = $script:ErrorBag.Count
+        detailPath = $detailPath
+        pivotPath  = $pivotPath
+        logPath    = $logPath
+    }
+    $endParams = @{
+        Level     = 'INFO'
+        Phase     = 'Complete'
+        EventName = 'ScriptEnd'
+        Message   = 'AD Permissions Analyzer completed.'
+        Data      = $endData
+    }
+    Write-LogEvent @endParams
+
+    if ($script:ErrorBag.Count -gt 0) { $exitCode = 2 }
+}
+catch {
+    $exitCode = 1
+    $fatalParams = @{
+        Level     = 'ERROR'
+        Phase     = 'Fatal'
+        EventName = 'ScriptFatal'
+        Message   = $_.Exception.Message
+        Data      = @{
+            exceptionType    = $_.Exception.GetType().FullName
+            scriptStackTrace = $_.ScriptStackTrace
+        }
+    }
+    try { Write-LogEvent @fatalParams } catch {
+        # Logging failed inside the fatal handler — the original error is still
+        # surfaced via Write-Error below, so swallow this one.
+        $null = $_
+    }
+    Write-Error -ErrorRecord $_ -ErrorAction Continue
+}
+finally {
+    if ($script:LogWriter) {
+        $script:LogWriter.Flush()
+        $script:LogWriter.Dispose()
+    }
+}
+
+exit $exitCode
