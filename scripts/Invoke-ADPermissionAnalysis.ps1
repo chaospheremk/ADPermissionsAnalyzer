@@ -142,11 +142,13 @@ $script:Phase1LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-Dis
 $script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1'
 $script:Phase3LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase3-AceParsing.ps1'
 $script:Phase4LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase4-TrusteeResolution.ps1'
+$script:Phase5LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase5-InheritanceSource.ps1'
 
 . $script:Phase1LibPath
 . $script:Phase2LibPath
 . $script:Phase3LibPath
 . $script:Phase4LibPath
+. $script:Phase5LibPath
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -653,8 +655,65 @@ try {
     Write-LogEvent @phase4EndParams
 
     # --- Phase 5: Inheritance source resolution ----------------------------
-    # TODO(plan §18.6): Resolve-InheritanceSource with composite-key index +
-    #                   DACL_PROTECTED short-circuit.
+    $phase5Start = [DateTime]::UtcNow
+    $phase5StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase5'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 5: inheritance source resolution.'
+    }
+    Write-LogEvent @phase5StartParams
+
+    $aceIndex = New-AceIndex -AceRecords $aceRecords
+
+    $ncDns = [List[string]]::new()
+    foreach ($nc in $namingContexts) {
+        $ncDns.Add($nc.DistinguishedName)
+    }
+
+    $protectedDaclAnomalies = [List[PSObject]]::new()
+    $resolveParams = @{
+        AceRecords                      = $aceRecords
+        AceIndex                        = $aceIndex
+        NamingContextDistinguishedNames = $ncDns.ToArray()
+        ProtectedDaclAnomalies          = $protectedDaclAnomalies
+    }
+    $phase5Stats = Resolve-InheritanceSource @resolveParams
+
+    foreach ($anomaly in $protectedDaclAnomalies) {
+        $anomalyParams = @{
+            Level     = 'WARN'
+            Phase     = 'Phase5'
+            EventName = 'BatchError'
+            Message   = "InheritedAceOnProtectedDacl on $($anomaly.ObjectDN)."
+            Data      = @{
+                reason     = 'InheritedAceOnProtectedDacl'
+                objectDN   = $anomaly.ObjectDN
+                trusteeSid = $anomaly.TrusteeSid
+                accessMask = $anomaly.AccessMask
+                aceIndex   = $anomaly.AceIndex
+            }
+        }
+        Write-LogEvent @anomalyParams
+        $script:ErrorBag.Add($anomaly)
+    }
+
+    $phase5ElapsedMs = [int] ([DateTime]::UtcNow - $phase5Start).TotalMilliseconds
+    $phase5EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase5'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 5 complete.'
+        Data      = @{
+            indexed         = $phase5Stats.Indexed
+            inheritedTotal  = $phase5Stats.InheritedTotal
+            resolved        = $phase5Stats.Resolved
+            unresolved      = $phase5Stats.Unresolved
+            protectedDacl   = $phase5Stats.ProtectedDacl
+            elapsedMs       = $phase5ElapsedMs
+        }
+    }
+    Write-LogEvent @phase5EndParams
 
     # --- Phase 6: Output (streaming) ---------------------------------------
     # TODO(plan §18.7-8): Write-DetailCsv (StreamWriter), Write-PivotCsv from
