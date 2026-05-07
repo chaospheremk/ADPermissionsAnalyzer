@@ -7,7 +7,7 @@
     PSSASettingsPath  = 'PSScriptAnalyzerSettings.psd1'
 
     # ScanPaths feeds Lint; CoveragePaths feeds Pester code coverage.
-    # TODO: extend with the analyzer script paths once defined (see docs/AD-Permissions-Analyzer-Plan.md §18).
+    # 'scripts' is recursive on disk and covers scripts/lib/* as well.
     ScanPaths         = @('scripts', 'Export-ScriptDocumentation.ps1')
     CoveragePaths     = @('scripts')
 
