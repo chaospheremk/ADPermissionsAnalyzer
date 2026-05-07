@@ -155,6 +155,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Synthetic.Owner / PARSE_ERROR rows still get the columns added with
   empty values for uniform Phase 6 schema).
 
+- `scripts/lib/Phase6-Output.ps1` — Phase 6 detail-CSV writer (plan §18.7):
+  `New-CsvFieldEscaper` (RFC-4180 rule — quote when value contains `,` /
+  `"` / CR / LF; double internal `"`; passthrough otherwise),
+  `Write-CsvHeader` (writes the 30-column header line via the supplied
+  `[StreamWriter]`; column order lives in `$script:Phase6DetailColumns`,
+  the single source of truth shared with `ConvertTo-DetailRow`),
+  `ConvertTo-DetailRow` (pure transform: ACE record + AceTrustee +
+  EffectiveTrustee + IsThroughGroup + GroupExpansionPath + NamingContext
+  + CollectedAt → `[string[]]` of escaped fields in plan-§11 order),
+  `Get-EffectiveTrusteeRecord` (single-pass fan-out: cache-hit non-empty
+  group → one tuple per cached transitive member with `IsThroughGroup =
+  $true`; otherwise direct trustee with `IsThroughGroup = $false`; cache
+  miss falls back to a synthetic trustee carrying the raw SID),
+  `Resolve-NamingContextLabel` (longest-suffix DN match against the NC
+  list, memoised per ObjectDN — Schema NC wins over Configuration NC for
+  Schema-scoped objects), `Update-PivotStat` (per-row mutation of the
+  `$PivotStats` accumulator; lazy-seeds each EffectiveTrusteeSid bucket
+  on first emission), `Write-DetailCsv` (orchestrator: opens
+  `[StreamWriter]` UTF-8 no-BOM with `AutoFlush = $false`, header → for
+  each ACE expand → write/update → flush at end; `-ProgressCallback`
+  scriptblock fires every `-ProgressInterval` rows so the entry script
+  forwards to `Write-LogEvent` without coupling the lib to logging).
+- Phase 6 wired into `Invoke-ADPermissionAnalysis.ps1`: creates
+  `$script:PivotStats` and the run's `$collectedAt` ISO-8601 stamp after
+  Phase 5 `PhaseEnd`, calls `Write-DetailCsv` with a `Write-LogEvent`-
+  forwarding progress callback (`Phase6Progress` every 50 000 rows plus
+  `Write-Progress` ticks), then emits `PhaseEnd` with `detailRowCount`,
+  `distinctTrustees`, and `elapsedMs`. `$script:PivotStats` is left in
+  place for Step 8's pivot-CSV writer to consume directly with no second
+  pass over `$aceRecords`.
+- `Tests/Phase6-Output.Tests.ps1` — Pester suite (16 cases) covering
+  `New-CsvFieldEscaper` (clean string passthrough, `$null`, comma
+  trigger, embedded `"` doubles + quotes, embedded LF, embedded CR);
+  `ConvertTo-DetailRow` (column count + order via 30-element
+  assertions, Synthetic.Owner row passthrough with AceIndex = -1 /
+  OwnerImplicit / Allow, PARSE_ERROR row preserves the captured
+  exception message in ObjectTypeName, InheritanceSourceDN populated for
+  inherited rows); `Get-EffectiveTrusteeRecord` (direct-trustee one-tuple
+  with `IsThroughGroup = $false`, group fan-out to two cached members
+  with `GroupExpansionPath` = group name, terminal-skip path emits the
+  group as itself, cache-miss falls back to synthetic trustee);
+  `Write-DetailCsv` end-to-end (writes header + N body lines and a
+  RightsDecoded field containing comma + double-quote round-trips through
+  `Import-Csv` correctly; `$PivotStats` populated with expected counters
+  per trustee — TotalAceCount / Direct vs Indirect / Allow vs Deny /
+  Explicit vs Inherited / DistinctObjectDns / RightsBreakdown — across a
+  4-row fixture mixing direct and group-expanded trustees).
+
 ### Changed
 
 - `Invoke-PagedLdapSearch` is now a materialising thin wrapper over a new
