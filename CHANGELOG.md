@@ -70,6 +70,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   propagation, work-unit owner+DACL emission, PARSE_ERROR placeholder
   isolation, runspace pool aggregation, BatchError capture, variable
   injection, and StartupScripts dot-source.
+- `scripts/lib/Phase4-TrusteeResolution.ps1` — Phase 4 helpers (plan §18.5):
+  `Resolve-NTAccount` (mockable wrapper around `[SecurityIdentifier].Translate`),
+  `ConvertTo-LdapBinaryFilter` (escapes a SID into the `\xx\xx` form an
+  `objectSid` filter expects), `Get-PrincipalTypeFromObjectClass` (pure
+  classifier with `msDS-GroupManagedServiceAccount` / `msDS-ManagedServiceAccount`
+  / `computer` / `group` / `user` priority — gMSA wins over its inherited
+  base classes), `Get-DomainSid` (base-scope `objectSid` read on the domain NC
+  root), `New-WellKnownSidSkipSet` (universal SIDs from plan §10 plus
+  domain-relative RIDs `-498` / `-513` / `-514` / `-515` / `-516` / `-521`
+  resolved against the runtime domain SID), `Test-IsTerminalSid`
+  (HashSet lookup + `S-1-5-32-*` BUILTIN prefix match), `Get-DistinctTrusteeSet`
+  (single-pass dedupe over `$aceRecords` covering DACL + Synthetic.Owner rows),
+  `Resolve-DomainPrincipal`, `Resolve-ForeignSecurityPrincipal`,
+  `Resolve-TrusteeSid` (cache → Translate → WellKnownSidMap → FSP → Orphaned
+  per plan §5; `BUILTIN\*` and `NT AUTHORITY\*` translates short-circuit to
+  `WellKnown` without an LDAP roundtrip), `Expand-GroupTransitive`
+  (`(memberOf:1.2.840.113556.1.4.1941:=<groupDN>)` against the domain NC
+  subtree, cached by group SID, defensive `-MaxMembers` cap default 100000).
+- Phase 4 wired into `Invoke-ADPermissionAnalysis.ps1`: runs single-threaded
+  after the Phase 3 drain — discovers domain SID + builds the skip set,
+  dedupes trustees, resolves all distinct SIDs into `$script:TrusteeCache`,
+  expands non-terminal groups with a DN into `$script:GroupExpansionCache`
+  (skipped entirely under `-SkipTransitiveExpansion`), emits
+  `PhaseStart` / `OrphanSid` (one per distinct orphan) / `PhaseEnd` events
+  with distinct/resolved/orphan/expanded counts and group-expansion cache
+  hit ratio per plan §13.
+- `Tests/Phase4-TrusteeResolution.Tests.ps1` — Pester suite (28 cases)
+  mocking at `Resolve-NTAccount` and `Invoke-PagedLdapSearch`. Covers
+  cache short-circuit (zero LSA + zero LDAP after first hit),
+  `NT AUTHORITY\SYSTEM` translate-only path, well-known SID fallback when
+  Translate throws, in-domain User resolution via Translate +
+  LDAP-by-objectSid, sMSA vs gMSA via objectClass priority, FSP
+  classification with FSP-container search-base filter, Orphan when all
+  paths fail, `Test-IsTerminalSid` against Everyone / Domain Users /
+  BUILTIN aliases, `Get-DistinctTrusteeSet` dedupe across DACL +
+  Synthetic.Owner rows, group transitive expansion (nested A → B →
+  {user1, user2}) with cache populated, repeat-call cache short-circuit
+  on `Expand-GroupTransitive`, and `Get-DomainSid` round-trip + empty-NC
+  throw.
 
 ### Changed
 

@@ -141,10 +141,12 @@ $ErrorActionPreference = 'Stop'
 $script:Phase1LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1'
 $script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1'
 $script:Phase3LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase3-AceParsing.ps1'
+$script:Phase4LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase4-TrusteeResolution.ps1'
 
 . $script:Phase1LibPath
 . $script:Phase2LibPath
 . $script:Phase3LibPath
+. $script:Phase4LibPath
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -544,8 +546,111 @@ try {
     Write-LogEvent @phase3EndParams
 
     # --- Phase 4: Trustee resolution & group expansion ---------------------
-    # TODO(plan §18.5): Resolve-TrusteeSid, Expand-GroupTransitive,
-    #                   Get-DistinctTrusteeSet, well-known SID skip set.
+    $phase4Start = [DateTime]::UtcNow
+    $phase4StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase4'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 4: trustee resolution + group expansion.'
+    }
+    Write-LogEvent @phase4StartParams
+
+    $domainContext = ($namingContexts.Where({ $_.Type -eq 'Domain' }))[0]
+    if (-not $domainContext) {
+        throw 'Domain NC not present in RootDSE — Phase 4 cannot resolve trustees.'
+    }
+
+    $domainSid = Get-DomainSid -Connection $script:LdapConnection `
+                               -DomainNamingContext $domainContext.DistinguishedName
+    $skipSet   = New-WellKnownSidSkipSet -DomainSid $domainSid
+
+    $script:TrusteeCache = [Dictionary[string, PSObject]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $script:GroupExpansionCache = [Dictionary[string, List[PSObject]]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $distinctTrustees = Get-DistinctTrusteeSet -AceRecords $aceRecords
+    $orphanCount      = 0
+    $loggedOrphans    = [HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($sid in $distinctTrustees) {
+        $resolveParams = @{
+            Sid                 = $sid
+            Cache               = $script:TrusteeCache
+            WellKnownSidMap     = $wellKnownSidMap
+            Connection          = $script:LdapConnection
+            DomainNamingContext = $domainContext.DistinguishedName
+        }
+        $trustee = Resolve-TrusteeSid @resolveParams
+
+        if ($trustee.PrincipalType -eq 'Orphaned') {
+            $orphanCount++
+            if ($loggedOrphans.Add($sid)) {
+                $orphanParams = @{
+                    Level     = 'INFO'
+                    Phase     = 'Phase4'
+                    EventName = 'OrphanSid'
+                    Message   = "Orphan trustee SID: $sid"
+                    Data      = @{ sid = $sid }
+                }
+                Write-LogEvent @orphanParams
+            }
+        }
+    }
+
+    $expansionLookups = 0
+    $expansionHits    = 0
+    $expansionMisses  = 0
+    if (-not $SkipTransitiveExpansion) {
+        foreach ($kvp in $script:TrusteeCache.GetEnumerator()) {
+            $trustee = $kvp.Value
+            if ($trustee.PrincipalType -ne 'Group') { continue }
+            if (-not $trustee.DistinguishedName)   { continue }
+            if (Test-IsTerminalSid -Sid $trustee.Sid -SkipSet $skipSet) { continue }
+
+            $expansionLookups++
+            if ($script:GroupExpansionCache.ContainsKey($trustee.Sid)) {
+                $expansionHits++
+                continue
+            }
+            $expansionMisses++
+
+            $expandParams = @{
+                GroupSid               = $trustee.Sid
+                GroupDistinguishedName = $trustee.DistinguishedName
+                Cache                  = $script:GroupExpansionCache
+                Connection             = $script:LdapConnection
+                DomainNamingContext    = $domainContext.DistinguishedName
+            }
+            [void] (Expand-GroupTransitive @expandParams)
+        }
+    }
+
+    $hitRatio = if ($expansionLookups -gt 0) {
+        [math]::Round($expansionHits / $expansionLookups, 4)
+    }
+    else { 0.0 }
+
+    $phase4ElapsedMs = [int] ([DateTime]::UtcNow - $phase4Start).TotalMilliseconds
+    $phase4EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase4'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 4 complete.'
+        Data      = @{
+            distinctTrustees       = $distinctTrustees.Count
+            resolvedTrustees       = $script:TrusteeCache.Count
+            orphanCount            = $orphanCount
+            expandedGroups         = $expansionMisses
+            expansionLookups       = $expansionLookups
+            expansionCacheHitRatio = $hitRatio
+            domainSid              = $domainSid
+            skipTransitiveExpansion = [bool] $SkipTransitiveExpansion
+            elapsedMs              = $phase4ElapsedMs
+        }
+    }
+    Write-LogEvent @phase4EndParams
 
     # --- Phase 5: Inheritance source resolution ----------------------------
     # TODO(plan §18.6): Resolve-InheritanceSource with composite-key index +
