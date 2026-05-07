@@ -110,10 +110,108 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on `Expand-GroupTransitive`, and `Get-DomainSid` round-trip + empty-NC
   throw.
 
+- `scripts/lib/Phase5-InheritanceSource.ps1` — Phase 5 helpers (plan §18.6):
+  `New-AceIndex` (composite-key `Dictionary[ValueTuple[string, string,
+  uint32, guid], List[PSObject]]` keyed by `(ObjectDN-upper, TrusteeSid,
+  AccessMask, ObjectTypeGuid)` over EXPLICIT rows only; skips inherited,
+  Synthetic.Owner `AceIndex = -1`, and PARSE_ERROR `AceIndex = -2`),
+  `Get-ParentDistinguishedName` (char-by-char DN tokenizer respecting
+  `\,` / `\\` / `\HH` LDAP escapes, returns `$null` at NC root),
+  `Test-IsContainerClass` (heuristic over the small set of AD container
+  classes), `Test-InheritanceFlagsPropagateTo` (pure rule over
+  `AceFlagsRaw` byte + `InheritedObjectTypeName` + descendant class +
+  `IsDirectChild`; encodes ContainerInherit / ObjectInherit container-vs-leaf
+  gating, NoPropagateInherit level-1-only halt, InheritOnly transparent for
+  descendants, InheritedObjectType class filter via OI string equality),
+  `Resolve-InheritanceSource` (mutates `$aceRecords` in place — adds
+  `InheritanceSourceDN` and `InheritanceSourceNote` columns on every row;
+  DACL_PROTECTED short-circuits to `InconsistentProtectedDacl` and emits
+  the anomaly into `-ProtectedDaclAnomalies`; otherwise walks the parent
+  chain via `Get-ParentDistinguishedName`, direct-lookup at each ancestor,
+  first matching candidate wins; `SchemaDefaultOrUnresolved` fallback;
+  stops at NC root or beyond; returns stats record with `Indexed`,
+  `InheritedTotal`, `Resolved`, `Unresolved`, `ProtectedDacl`).
+- Phase 5 wired into `Invoke-ADPermissionAnalysis.ps1`: runs single-threaded
+  after Phase 4 `PhaseEnd`. Builds the index, extracts NC DNs into a
+  `List[string]`, calls `Resolve-InheritanceSource` with an anomaly sink,
+  forwards each `InheritedAceOnProtectedDacl` anomaly to `Write-LogEvent`
+  at WARN with `EventName = 'BatchError'` (matches Phase 3's BatchError
+  contract from §13) AND adds it to `$script:ErrorBag` so the §14
+  exit-code-2 path picks them up. `PhaseStart` / `PhaseEnd` events emit
+  per plan §13 with `indexed` / `inheritedTotal` / `resolved` /
+  `unresolved` / `protectedDacl` counts.
+- `Tests/Phase5-InheritanceSource.Tests.ps1` — Pester suite (24 cases)
+  covering `New-AceIndex` (explicit-only indexing, inherited skip,
+  Synthetic.Owner / PARSE_ERROR skip, composite-key collision stacking),
+  `Get-ParentDistinguishedName` (standard DN, escaped-comma RDN value,
+  NC root → null, empty input → null), `Test-InheritanceFlagsPropagateTo`
+  (ContainerInherit/ObjectInherit container-vs-leaf gating in both
+  directions, InheritOnly transparent for descendants, NoPropagateInherit
+  level-1-only halt, InheritedObjectType class filter user/group, no
+  inherit flags returns false), and `Resolve-InheritanceSource`
+  end-to-end (direct-parent resolution, two-level walk past failing-flag
+  level-1 candidate, DACL_PROTECTED short-circuit + anomaly emission,
+  `SchemaDefaultOrUnresolved` fallback, explicit rows un-mutated, and
+  Synthetic.Owner / PARSE_ERROR rows still get the columns added with
+  empty values for uniform Phase 6 schema).
+
+- `scripts/lib/Phase6-Output.ps1` — Phase 6 detail-CSV writer (plan §18.7):
+  `New-CsvFieldEscaper` (RFC-4180 rule — quote when value contains `,` /
+  `"` / CR / LF; double internal `"`; passthrough otherwise),
+  `Write-CsvHeader` (writes the 30-column header line via the supplied
+  `[StreamWriter]`; column order lives in `$script:Phase6DetailColumns`,
+  the single source of truth shared with `ConvertTo-DetailRow`),
+  `ConvertTo-DetailRow` (pure transform: ACE record + AceTrustee +
+  EffectiveTrustee + IsThroughGroup + GroupExpansionPath + NamingContext
+  + CollectedAt → `[string[]]` of escaped fields in plan-§11 order),
+  `Get-EffectiveTrusteeRecord` (single-pass fan-out: cache-hit non-empty
+  group → one tuple per cached transitive member with `IsThroughGroup =
+  $true`; otherwise direct trustee with `IsThroughGroup = $false`; cache
+  miss falls back to a synthetic trustee carrying the raw SID),
+  `Resolve-NamingContextLabel` (longest-suffix DN match against the NC
+  list, memoised per ObjectDN — Schema NC wins over Configuration NC for
+  Schema-scoped objects), `Update-PivotStat` (per-row mutation of the
+  `$PivotStats` accumulator; lazy-seeds each EffectiveTrusteeSid bucket
+  on first emission), `Write-DetailCsv` (orchestrator: opens
+  `[StreamWriter]` UTF-8 no-BOM with `AutoFlush = $false`, header → for
+  each ACE expand → write/update → flush at end; `-ProgressCallback`
+  scriptblock fires every `-ProgressInterval` rows so the entry script
+  forwards to `Write-LogEvent` without coupling the lib to logging).
+- Phase 6 wired into `Invoke-ADPermissionAnalysis.ps1`: creates
+  `$script:PivotStats` and the run's `$collectedAt` ISO-8601 stamp after
+  Phase 5 `PhaseEnd`, calls `Write-DetailCsv` with a `Write-LogEvent`-
+  forwarding progress callback (`Phase6Progress` every 50 000 rows plus
+  `Write-Progress` ticks), then emits `PhaseEnd` with `detailRowCount`,
+  `distinctTrustees`, and `elapsedMs`. `$script:PivotStats` is left in
+  place for Step 8's pivot-CSV writer to consume directly with no second
+  pass over `$aceRecords`.
+- `Tests/Phase6-Output.Tests.ps1` — Pester suite (16 cases) covering
+  `New-CsvFieldEscaper` (clean string passthrough, `$null`, comma
+  trigger, embedded `"` doubles + quotes, embedded LF, embedded CR);
+  `ConvertTo-DetailRow` (column count + order via 30-element
+  assertions, Synthetic.Owner row passthrough with AceIndex = -1 /
+  OwnerImplicit / Allow, PARSE_ERROR row preserves the captured
+  exception message in ObjectTypeName, InheritanceSourceDN populated for
+  inherited rows); `Get-EffectiveTrusteeRecord` (direct-trustee one-tuple
+  with `IsThroughGroup = $false`, group fan-out to two cached members
+  with `GroupExpansionPath` = group name, terminal-skip path emits the
+  group as itself, cache-miss falls back to synthetic trustee);
+  `Write-DetailCsv` end-to-end (writes header + N body lines and a
+  RightsDecoded field containing comma + double-quote round-trips through
+  `Import-Csv` correctly; `$PivotStats` populated with expected counters
+  per trustee — TotalAceCount / Direct vs Indirect / Allow vs Deny /
+  Explicit vs Inherited / DistinctObjectDns / RightsBreakdown — across a
+  4-row fixture mixing direct and group-expanded trustees).
+
 ### Changed
 
 - `Invoke-PagedLdapSearch` is now a materialising thin wrapper over a new
   streaming `Read-LdapEntry` primitive that supports `-AdditionalControls`.
   Phase 1 callers and their test mocks are unchanged.
+- Phase 5 is the FIRST phase that mutates `$aceRecords` — every row gains
+  `InheritanceSourceDN` (default `$null`) and `InheritanceSourceNote`
+  (default `''`) note properties so the Phase 6 detail-CSV schema is
+  uniform across explicit / inherited / Synthetic.Owner / PARSE_ERROR
+  rows. Earlier phases were producers or pure consumers.
 
 ### Fixed

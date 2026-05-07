@@ -143,12 +143,14 @@ $script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enu
 $script:Phase3LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase3-AceParsing.ps1'
 $script:Phase4LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase4-TrusteeResolution.ps1'
 $script:Phase5LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase5-InheritanceSource.ps1'
+$script:Phase6LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase6-Output.ps1'
 
 . $script:Phase1LibPath
 . $script:Phase2LibPath
 . $script:Phase3LibPath
 . $script:Phase4LibPath
 . $script:Phase5LibPath
+. $script:Phase6LibPath
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -716,8 +718,69 @@ try {
     Write-LogEvent @phase5EndParams
 
     # --- Phase 6: Output (streaming) ---------------------------------------
-    # TODO(plan §18.7-8): Write-DetailCsv (StreamWriter), Write-PivotCsv from
-    #                     incrementally-built $PivotStats.
+    $phase6Start = [DateTime]::UtcNow
+    $phase6StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase6'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 6: detail CSV streaming + pivot accumulator.'
+        Data      = @{ detailPath = $detailPath }
+    }
+    Write-LogEvent @phase6StartParams
+
+    $script:PivotStats = [Dictionary[string, PSObject]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $collectedAt = [DateTime]::UtcNow.ToString('o')
+
+    $progressCallback = {
+        param([hashtable] $Data)
+        $progressParams = @{
+            Level     = 'INFO'
+            Phase     = 'Phase6'
+            EventName = 'Phase6Progress'
+            Message   = "Phase 6 wrote $($Data.rowsWritten) detail rows."
+            Data      = $Data
+        }
+        Write-LogEvent @progressParams
+
+        $writeProgressParams = @{
+            Activity         = 'AD Permissions Analyzer - Phase 6'
+            Status           = "$($Data.rowsWritten) rows written"
+            CurrentOperation = "Elapsed: $($Data.elapsedMs) ms"
+        }
+        Write-Progress @writeProgressParams
+    }
+
+    $detailParams = @{
+        DetailPath          = $detailPath
+        AceRecords          = $aceRecords
+        TrusteeCache        = $script:TrusteeCache
+        GroupExpansionCache = $script:GroupExpansionCache
+        NamingContexts      = $namingContexts.ToArray()
+        PivotStats          = $script:PivotStats
+        CollectedAt         = $collectedAt
+        ProgressInterval    = 50000
+        ProgressCallback    = $progressCallback
+    }
+    $detailRowCount = Write-DetailCsv @detailParams
+
+    Write-Progress -Activity 'AD Permissions Analyzer - Phase 6' -Completed
+
+    $phase6ElapsedMs = [int] ([DateTime]::UtcNow - $phase6Start).TotalMilliseconds
+    $phase6EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase6'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 6 detail CSV complete.'
+        Data      = @{
+            detailRowCount    = $detailRowCount
+            distinctTrustees  = $script:PivotStats.Count
+            elapsedMs         = $phase6ElapsedMs
+        }
+    }
+    Write-LogEvent @phase6EndParams
+
+    # TODO(plan §18.8): Step 8 — Write-PivotCsv from $script:PivotStats.
 
     $endData = @{
         errorCount = $script:ErrorBag.Count
