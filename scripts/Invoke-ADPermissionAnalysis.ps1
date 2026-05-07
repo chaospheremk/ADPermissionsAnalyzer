@@ -780,7 +780,36 @@ try {
     }
     Write-LogEvent @phase6EndParams
 
-    # TODO(plan §18.8): Step 8 — Write-PivotCsv from $script:PivotStats.
+    # --- Phase 6 (cont.): Pivot CSV (incremental → flush) -----------------
+    $pivotStart = [DateTime]::UtcNow
+    $pivotStartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase6'
+        EventName = 'PivotStart'
+        Message   = 'Phase 6: pivot CSV write.'
+        Data      = @{ pivotPath = $pivotPath }
+    }
+    Write-LogEvent @pivotStartParams
+
+    $pivotParams = @{
+        PivotPath   = $pivotPath
+        Stats       = $script:PivotStats
+        CollectedAt = $collectedAt
+    }
+    $pivotRowCount = Write-PivotCsv @pivotParams
+
+    $pivotElapsedMs = [int] ([DateTime]::UtcNow - $pivotStart).TotalMilliseconds
+    $pivotEndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase6'
+        EventName = 'PivotEnd'
+        Message   = 'Phase 6 pivot CSV complete.'
+        Data      = @{
+            pivotRowCount = $pivotRowCount
+            elapsedMs     = $pivotElapsedMs
+        }
+    }
+    Write-LogEvent @pivotEndParams
 
     $endData = @{
         errorCount = $script:ErrorBag.Count

@@ -666,3 +666,274 @@ function Write-DetailCsv {
 
     $rowsWritten
 }
+
+# Pivot CSV column order — plan §11. Single source of truth for
+# Write-PivotCsv's header and ConvertTo-PivotRow's body.
+$script:Phase6PivotColumns = @(
+    'EffectiveTrusteeSid'
+    'EffectiveTrusteeName'
+    'EffectiveTrusteePrincipalType'
+    'EffectiveTrusteeDN'
+    'TotalAceCount'
+    'DirectAceCount'
+    'IndirectAceCount'
+    'DistinctObjectCount'
+    'AllowAceCount'
+    'DenyAceCount'
+    'ExplicitAceCount'
+    'InheritedAceCount'
+    'RightsSummary'
+    'NamingContextsTouched'
+    'ObjectClassesTouched'
+    'CollectedAt'
+)
+
+function Format-RightsSummary {
+    <#
+    .SYNOPSIS
+        Render the RightsBreakdown bucket as the plan §11 summary string
+        ("GenericAll:42; WriteProperty:118; ReadProperty:980").
+
+    .DESCRIPTION
+        Pure helper. Sort order: count descending, then name ascending
+        (ordinal-ignore-case) as tiebreaker so equal-count rights have a
+        stable, readable order. Empty / null dictionary returns ''.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [Dictionary[string, int]] $Breakdown
+    )
+
+    if ($null -eq $Breakdown -or $Breakdown.Count -eq 0) { return '' }
+
+    $entries = [List[PSObject]]::new()
+    foreach ($kvp in $Breakdown.GetEnumerator()) {
+        $entries.Add([PSCustomObject]@{ Name = $kvp.Key; Count = $kvp.Value })
+    }
+    $sorted = $entries.ToArray() |
+        Sort-Object -Property @{ Expression = 'Count'; Descending = $true },
+                              @{ Expression = 'Name';  Descending = $false }
+
+    $parts = [List[string]]::new()
+    foreach ($e in $sorted) {
+        $parts.Add("$($e.Name):$($e.Count)")
+    }
+    [string]::Join('; ', $parts)
+}
+
+function Format-NamingContextsTouched {
+    <#
+    .SYNOPSIS
+        Render the NamingContextsTouched HashSet as a sorted
+        semicolon-delimited string.
+
+    .DESCRIPTION
+        Pure helper. Sort order: ordinal-ignore-case ascending. Empty /
+        null set returns ''. Parameter is typed [object] rather than
+        [HashSet[string]] because the PowerShell parameter binder
+        unrolls a typed HashSet[string] argument — it converts to a
+        string[] via the IEnumerable surface and either rejects an empty
+        set or rebinds a singleton as a bare string. Accepting [object]
+        preserves the HashSet reference; .Count and foreach still work.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [object] $NamingContexts
+    )
+
+    if ($null -eq $NamingContexts) { return '' }
+
+    $items = [List[string]]::new()
+    foreach ($nc in $NamingContexts) {
+        if ([string]::IsNullOrEmpty($nc)) { continue }
+        $items.Add([string] $nc)
+    }
+    if ($items.Count -eq 0) { return '' }
+
+    $sorted = $items.ToArray() | Sort-Object -CaseSensitive:$false
+    [string]::Join(';', $sorted)
+}
+
+function Format-ObjectClassesTouched {
+    <#
+    .SYNOPSIS
+        Render the ObjectClassesTouched bucket as the plan §11
+        "user:14; group:3; organizationalUnit:1" summary string.
+
+    .DESCRIPTION
+        Pure helper. Sort order: count descending, then name ascending
+        (ordinal-ignore-case) as tiebreaker — same convention as
+        Format-RightsSummary. Empty / null dictionary returns ''.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [Dictionary[string, int]] $Classes
+    )
+
+    if ($null -eq $Classes -or $Classes.Count -eq 0) { return '' }
+
+    $entries = [List[PSObject]]::new()
+    foreach ($kvp in $Classes.GetEnumerator()) {
+        $entries.Add([PSCustomObject]@{ Name = $kvp.Key; Count = $kvp.Value })
+    }
+    $sorted = $entries.ToArray() |
+        Sort-Object -Property @{ Expression = 'Count'; Descending = $true },
+                              @{ Expression = 'Name';  Descending = $false }
+
+    $parts = [List[string]]::new()
+    foreach ($e in $sorted) {
+        $parts.Add("$($e.Name):$($e.Count)")
+    }
+    [string]::Join('; ', $parts)
+}
+
+function ConvertTo-PivotRow {
+    <#
+    .SYNOPSIS
+        Build one pivot-CSV row as an ordered [string[]] of escaped
+        fields per plan §11.
+
+    .DESCRIPTION
+        Pure transform: takes one PivotStats bucket (the PSObject seeded
+        by Update-PivotStat during detail streaming) plus the run's
+        CollectedAt timestamp, returns a [string[]] of RFC-4180-escaped
+        fields in pivot-column order. Caller joins with ',' and writes
+        via the StreamWriter.
+
+    .PARAMETER Bucket
+        Pivot accumulator entry (the PSCustomObject populated by
+        Update-PivotStat during Write-DetailCsv).
+
+    .PARAMETER CollectedAt
+        UTC ISO-8601 timestamp string for the run.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [PSObject] $Bucket,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $CollectedAt
+    )
+
+    $rightsSummary       = Format-RightsSummary       -Breakdown      $Bucket.RightsBreakdown
+    $namingContextsTouch = Format-NamingContextsTouched -NamingContexts $Bucket.NamingContextsTouched
+    $objectClassesTouch  = Format-ObjectClassesTouched -Classes        $Bucket.ObjectClassesTouched
+
+    $values = @(
+        [string] $Bucket.EffectiveTrusteeSid
+        [string] $Bucket.EffectiveTrusteeName
+        [string] $Bucket.EffectiveTrusteePrincipalType
+        [string] $Bucket.EffectiveTrusteeDN
+        ([string] $Bucket.TotalAceCount)
+        ([string] $Bucket.DirectAceCount)
+        ([string] $Bucket.IndirectAceCount)
+        ([string] $Bucket.DistinctObjectDns.Count)
+        ([string] $Bucket.AllowAceCount)
+        ([string] $Bucket.DenyAceCount)
+        ([string] $Bucket.ExplicitAceCount)
+        ([string] $Bucket.InheritedAceCount)
+        $rightsSummary
+        $namingContextsTouch
+        $objectClassesTouch
+        $CollectedAt
+    )
+
+    $escaped = [string[]]::new($values.Length)
+    for ($i = 0; $i -lt $values.Length; $i++) {
+        $escaped[$i] = New-CsvFieldEscaper -Value $values[$i]
+    }
+    , $escaped
+}
+
+function Write-PivotCsv {
+    <#
+    .SYNOPSIS
+        Write the per-trustee pivot CSV from the $PivotStats accumulator
+        per plan §11 / §12.
+
+    .DESCRIPTION
+        Opens a [StreamWriter] at -PivotPath (UTF-8, no BOM, AutoFlush
+        off — flushes once at end; same buffering contract as
+        Write-DetailCsv per ADR-018). Writes the header from
+        $script:Phase6PivotColumns, then one row per bucket via
+        ConvertTo-PivotRow.
+
+        Bucket order: TotalAceCount descending, EffectiveTrusteeName
+        ascending, EffectiveTrusteeSid ascending — most-active trustees
+        first to surface high-value rows for least-privilege review.
+
+        Returns an [int] of pivot rows written (one per distinct
+        effective trustee that emitted at least one detail row).
+
+    .PARAMETER PivotPath
+        Absolute path to the pivot CSV file.
+
+    .PARAMETER Stats
+        Phase 6 pivot accumulator populated by Write-DetailCsv (one
+        bucket per EffectiveTrusteeSid).
+
+    .PARAMETER CollectedAt
+        UTC ISO-8601 timestamp string for the run.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Writes one CSV file; the side effect is the documented output.')]
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $PivotPath,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [Dictionary[string, PSObject]] $Stats,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $CollectedAt
+    )
+
+    $writer = [StreamWriter]::new($PivotPath, $false, [UTF8Encoding]::new($false))
+    $writer.AutoFlush = $false
+
+    $rowsWritten = 0
+    try {
+        $writer.WriteLine([string]::Join(',', $script:Phase6PivotColumns))
+
+        $buckets = [List[PSObject]]::new()
+        foreach ($kvp in $Stats.GetEnumerator()) {
+            $buckets.Add($kvp.Value)
+        }
+        $ordered = $buckets.ToArray() |
+            Sort-Object -Property @{ Expression = 'TotalAceCount';        Descending = $true  },
+                                  @{ Expression = 'EffectiveTrusteeName'; Descending = $false },
+                                  @{ Expression = 'EffectiveTrusteeSid';  Descending = $false }
+
+        foreach ($bucket in $ordered) {
+            $row = ConvertTo-PivotRow -Bucket $bucket -CollectedAt $CollectedAt
+            $writer.WriteLine([string]::Join(',', $row))
+            $rowsWritten++
+        }
+
+        $writer.Flush()
+    }
+    finally {
+        $writer.Dispose()
+    }
+
+    $rowsWritten
+}

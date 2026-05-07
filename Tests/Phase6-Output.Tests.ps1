@@ -445,3 +445,380 @@ Describe 'Write-DetailCsv' {
         $memberBucket.DirectAceCount      | Should -Be 0
     }
 }
+
+Describe 'Format-RightsSummary' {
+    It 'returns empty string for an empty dictionary' {
+        $empty = [Dictionary[string, int]]::new()
+        Format-RightsSummary -Breakdown $empty | Should -Be ''
+    }
+
+    It 'returns empty string for $null' {
+        Format-RightsSummary -Breakdown $null | Should -Be ''
+    }
+
+    It 'sorts by count descending' {
+        $b = [Dictionary[string, int]]::new()
+        $b['GenericAll']    = 42
+        $b['WriteProperty'] = 118
+        $b['ReadProperty']  = 980
+
+        Format-RightsSummary -Breakdown $b |
+            Should -Be 'ReadProperty:980; WriteProperty:118; GenericAll:42'
+    }
+
+    It 'breaks ties by name ascending (ordinal-ignore-case)' {
+        $b = [Dictionary[string, int]]::new()
+        $b['WriteProperty'] = 5
+        $b['ReadProperty']  = 5
+        $b['GenericAll']    = 5
+
+        Format-RightsSummary -Breakdown $b |
+            Should -Be 'GenericAll:5; ReadProperty:5; WriteProperty:5'
+    }
+}
+
+Describe 'Format-NamingContextsTouched' {
+    It 'returns empty string for an empty set' {
+        $empty = [HashSet[string]]::new()
+        Format-NamingContextsTouched -NamingContexts $empty | Should -Be ''
+    }
+
+    It 'returns empty string for $null' {
+        Format-NamingContextsTouched -NamingContexts $null | Should -Be ''
+    }
+
+    It 'sorts ascending and joins with semicolons' {
+        $set = [HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        [void] $set.Add('Schema')
+        [void] $set.Add('Domain')
+        [void] $set.Add('Configuration')
+
+        Format-NamingContextsTouched -NamingContexts $set |
+            Should -Be 'Configuration;Domain;Schema'
+    }
+}
+
+Describe 'Format-ObjectClassesTouched' {
+    It 'returns empty string for an empty dictionary' {
+        $empty = [Dictionary[string, int]]::new()
+        Format-ObjectClassesTouched -Classes $empty | Should -Be ''
+    }
+
+    It 'returns empty string for $null' {
+        Format-ObjectClassesTouched -Classes $null | Should -Be ''
+    }
+
+    It 'sorts by count descending then name ascending' {
+        $b = [Dictionary[string, int]]::new()
+        $b['user']               = 14
+        $b['group']              = 3
+        $b['organizationalUnit'] = 1
+
+        Format-ObjectClassesTouched -Classes $b |
+            Should -Be 'user:14; group:3; organizationalUnit:1'
+    }
+
+    It 'tiebreaks equal counts by name ascending' {
+        $b = [Dictionary[string, int]]::new()
+        $b['zzz'] = 2
+        $b['aaa'] = 2
+        $b['mmm'] = 5
+
+        Format-ObjectClassesTouched -Classes $b |
+            Should -Be 'mmm:5; aaa:2; zzz:2'
+    }
+}
+
+Describe 'ConvertTo-PivotRow' {
+    BeforeAll {
+        function New-PivotBucket {
+            param(
+                [Parameter()] [string] $Sid                 = 'S-1-5-21-100-200-300-1001',
+                [Parameter()] [string] $Name                = 'LAB\u1',
+                [Parameter()] [string] $PrincipalType       = 'User',
+                [Parameter()] [string] $DistinguishedName   = 'CN=u1,OU=Users,DC=lab,DC=local',
+                [Parameter()] [int]    $TotalAceCount       = 0,
+                [Parameter()] [int]    $DirectAceCount      = 0,
+                [Parameter()] [int]    $IndirectAceCount    = 0,
+                [Parameter()] [int]    $AllowAceCount       = 0,
+                [Parameter()] [int]    $DenyAceCount        = 0,
+                [Parameter()] [int]    $ExplicitAceCount    = 0,
+                [Parameter()] [int]    $InheritedAceCount   = 0
+            )
+            [PSCustomObject]@{
+                EffectiveTrusteeSid           = $Sid
+                EffectiveTrusteeName          = $Name
+                EffectiveTrusteePrincipalType = $PrincipalType
+                EffectiveTrusteeDN            = $DistinguishedName
+                TotalAceCount                 = $TotalAceCount
+                DirectAceCount                = $DirectAceCount
+                IndirectAceCount              = $IndirectAceCount
+                AllowAceCount                 = $AllowAceCount
+                DenyAceCount                  = $DenyAceCount
+                ExplicitAceCount              = $ExplicitAceCount
+                InheritedAceCount             = $InheritedAceCount
+                DistinctObjectDns             = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                NamingContextsTouched         = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                RightsBreakdown               = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                ObjectClassesTouched          = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+            }
+        }
+    }
+
+    It 'emits one field per plan-§11 pivot column in order' {
+        $bucket = New-PivotBucket -TotalAceCount 5 -DirectAceCount 3 -IndirectAceCount 2 `
+            -AllowAceCount 4 -DenyAceCount 1 -ExplicitAceCount 4 -InheritedAceCount 1
+        [void] $bucket.DistinctObjectDns.Add('CN=u1,OU=Users,DC=lab,DC=local')
+        [void] $bucket.DistinctObjectDns.Add('CN=u2,OU=Users,DC=lab,DC=local')
+        [void] $bucket.NamingContextsTouched.Add('Domain')
+        [void] $bucket.NamingContextsTouched.Add('Configuration')
+        $bucket.RightsBreakdown['ReadProperty']  = 3
+        $bucket.RightsBreakdown['WriteProperty'] = 1
+        $bucket.RightsBreakdown['GenericAll']    = 1
+        $bucket.ObjectClassesTouched['user']  = 4
+        $bucket.ObjectClassesTouched['group'] = 1
+
+        $row = ConvertTo-PivotRow -Bucket $bucket -CollectedAt $script:CollectedAt
+
+        # 16 columns per plan §11.
+        $row.Length | Should -Be 16
+        $row[0]     | Should -Be 'S-1-5-21-100-200-300-1001'
+        $row[1]     | Should -Be 'LAB\u1'
+        $row[2]     | Should -Be 'User'
+        # DN contains commas — escape rule quotes the field per RFC 4180.
+        $row[3]     | Should -Be '"CN=u1,OU=Users,DC=lab,DC=local"'
+    }
+
+    It 'computes scalar counts and the three formatted summaries' {
+        $bucket = New-PivotBucket -TotalAceCount 5 -DirectAceCount 3 -IndirectAceCount 2 `
+            -AllowAceCount 4 -DenyAceCount 1 -ExplicitAceCount 4 -InheritedAceCount 1
+        [void] $bucket.DistinctObjectDns.Add('CN=u1,OU=Users,DC=lab,DC=local')
+        [void] $bucket.DistinctObjectDns.Add('CN=u2,OU=Users,DC=lab,DC=local')
+        [void] $bucket.NamingContextsTouched.Add('Domain')
+        [void] $bucket.NamingContextsTouched.Add('Configuration')
+        $bucket.RightsBreakdown['ReadProperty']  = 3
+        $bucket.RightsBreakdown['WriteProperty'] = 1
+        $bucket.RightsBreakdown['GenericAll']    = 1
+        $bucket.ObjectClassesTouched['user']  = 4
+        $bucket.ObjectClassesTouched['group'] = 1
+
+        $row = ConvertTo-PivotRow -Bucket $bucket -CollectedAt $script:CollectedAt
+
+        $row[4]  | Should -Be '5'   # TotalAceCount
+        $row[5]  | Should -Be '3'   # DirectAceCount
+        $row[6]  | Should -Be '2'   # IndirectAceCount
+        $row[7]  | Should -Be '2'   # DistinctObjectCount (HashSet.Count)
+        $row[8]  | Should -Be '4'   # AllowAceCount
+        $row[9]  | Should -Be '1'   # DenyAceCount
+        $row[10] | Should -Be '4'   # ExplicitAceCount
+        $row[11] | Should -Be '1'   # InheritedAceCount
+        # RightsSummary contains '; ' and ':' which aren't escape triggers.
+        $row[12] | Should -Be 'ReadProperty:3; GenericAll:1; WriteProperty:1'
+        $row[13] | Should -Be 'Configuration;Domain'
+        $row[14] | Should -Be 'user:4; group:1'
+        $row[15] | Should -Be $script:CollectedAt
+    }
+}
+
+Describe 'Write-PivotCsv' {
+    BeforeAll {
+        $script:PivotWorkDir = Join-Path ([Path]::GetTempPath()) ("phase6-pivot-{0}" -f ([guid]::NewGuid()))
+        New-Item -ItemType Directory -Path $script:PivotWorkDir -Force | Out-Null
+
+        function New-StatsFixture {
+            $stats = [Dictionary[string, PSObject]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase)
+
+            # Bucket A — high-activity user. Includes a right name with embedded
+            # ',' and ';' so the round-trip exercises the CSV escape boundary.
+            $a = [PSCustomObject]@{
+                EffectiveTrusteeSid           = 'S-1-5-21-100-200-300-1001'
+                EffectiveTrusteeName          = 'LAB\u1'
+                EffectiveTrusteePrincipalType = 'User'
+                EffectiveTrusteeDN            = 'CN=u1,OU=Users,DC=lab,DC=local'
+                TotalAceCount                 = 10
+                DirectAceCount                = 7
+                IndirectAceCount              = 3
+                AllowAceCount                 = 8
+                DenyAceCount                  = 2
+                ExplicitAceCount              = 6
+                InheritedAceCount             = 4
+                DistinctObjectDns             = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                NamingContextsTouched         = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                RightsBreakdown               = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                ObjectClassesTouched          = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+            }
+            [void] $a.DistinctObjectDns.Add('CN=x,DC=lab,DC=local')
+            [void] $a.NamingContextsTouched.Add('Domain')
+            $a.RightsBreakdown['Weird,Right']    = 4
+            $a.RightsBreakdown['Other;Right']    = 3
+            $a.RightsBreakdown['ReadProperty']   = 3
+            $a.ObjectClassesTouched['user']      = 10
+            $stats[$a.EffectiveTrusteeSid] = $a
+
+            # Bucket B — middle-activity group.
+            $b = [PSCustomObject]@{
+                EffectiveTrusteeSid           = 'S-1-5-21-100-200-300-2001'
+                EffectiveTrusteeName          = 'LAB\grp'
+                EffectiveTrusteePrincipalType = 'Group'
+                EffectiveTrusteeDN            = 'CN=grp,OU=Groups,DC=lab,DC=local'
+                TotalAceCount                 = 4
+                DirectAceCount                = 4
+                IndirectAceCount              = 0
+                AllowAceCount                 = 4
+                DenyAceCount                  = 0
+                ExplicitAceCount              = 4
+                InheritedAceCount             = 0
+                DistinctObjectDns             = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                NamingContextsTouched         = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                RightsBreakdown               = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                ObjectClassesTouched          = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+            }
+            [void] $b.DistinctObjectDns.Add('CN=y,DC=lab,DC=local')
+            [void] $b.NamingContextsTouched.Add('Configuration')
+            $b.RightsBreakdown['GenericAll']     = 4
+            $b.ObjectClassesTouched['group']     = 4
+            $stats[$b.EffectiveTrusteeSid] = $b
+
+            # Bucket C — low-activity orphan.
+            $c = [PSCustomObject]@{
+                EffectiveTrusteeSid           = 'S-1-5-21-orphan-9999'
+                EffectiveTrusteeName          = 'S-1-5-21-orphan-9999'
+                EffectiveTrusteePrincipalType = 'Orphaned'
+                EffectiveTrusteeDN            = ''
+                TotalAceCount                 = 1
+                DirectAceCount                = 1
+                IndirectAceCount              = 0
+                AllowAceCount                 = 1
+                DenyAceCount                  = 0
+                ExplicitAceCount              = 1
+                InheritedAceCount             = 0
+                DistinctObjectDns             = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                NamingContextsTouched         = [HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                RightsBreakdown               = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                ObjectClassesTouched          = [Dictionary[string, int]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+            }
+            [void] $c.DistinctObjectDns.Add('CN=z,DC=lab,DC=local')
+            [void] $c.NamingContextsTouched.Add('Domain')
+            $c.RightsBreakdown['ReadProperty']   = 1
+            $c.ObjectClassesTouched['user']      = 1
+            $stats[$c.EffectiveTrusteeSid] = $c
+
+            return $stats
+        }
+    }
+
+    AfterAll {
+        if (Test-Path -LiteralPath $script:PivotWorkDir) {
+            Remove-Item -LiteralPath $script:PivotWorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'writes header + N body rows and round-trips through Import-Csv' {
+        $stats = New-StatsFixture
+        $pivotPath = Join-Path $script:PivotWorkDir 'pivot.csv'
+
+        $count = Write-PivotCsv -PivotPath $pivotPath -Stats $stats `
+                                -CollectedAt $script:CollectedAt
+
+        $count                              | Should -Be 3
+        Test-Path -LiteralPath $pivotPath   | Should -BeTrue
+
+        $imported = Import-Csv -LiteralPath $pivotPath
+        $imported.Count                                 | Should -Be 3
+
+        # Sort: TotalAceCount desc → A (10), B (4), C (1).
+        $imported[0].EffectiveTrusteeSid                | Should -Be 'S-1-5-21-100-200-300-1001'
+        $imported[0].TotalAceCount                      | Should -Be '10'
+        $imported[0].DistinctObjectCount                | Should -Be '1'
+        $imported[1].EffectiveTrusteeSid                | Should -Be 'S-1-5-21-100-200-300-2001'
+        $imported[2].EffectiveTrusteeSid                | Should -Be 'S-1-5-21-orphan-9999'
+
+        $imported[0].CollectedAt                        | Should -Be $script:CollectedAt
+    }
+
+    It 'round-trips a RightsSummary containing embedded comma + semicolon' {
+        $stats = New-StatsFixture
+        $pivotPath = Join-Path $script:PivotWorkDir 'pivot-escape.csv'
+
+        [void] (Write-PivotCsv -PivotPath $pivotPath -Stats $stats `
+                               -CollectedAt $script:CollectedAt)
+
+        $imported = Import-Csv -LiteralPath $pivotPath
+        # Bucket A's RightsBreakdown has 'Weird,Right' = 4, 'Other;Right' = 3,
+        # 'ReadProperty' = 3 — sorted by count desc / name asc:
+        #   Weird,Right:4 ; Other;Right:3 ; ReadProperty:3
+        $imported[0].RightsSummary |
+            Should -Be 'Weird,Right:4; Other;Right:3; ReadProperty:3'
+    }
+
+    It 'pivot TotalAceCount sums equal Write-DetailCsv row count (scenario 4 reconciliation)' {
+        # Build a fresh detail-CSV run so the pivot is the live accumulator,
+        # not a hand-built fixture. Plan §17 scenario 4: pivot reconciles with
+        # detail aggregates.
+        $cache = [Dictionary[string, PSObject]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        $expansion = [Dictionary[string, List[PSObject]]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+
+        $cache[$script:UserSid]  = New-Trustee -Sid $script:UserSid  -Name 'LAB\u1'  -PrincipalType 'User'
+        $cache[$script:GroupSid] = New-Trustee -Sid $script:GroupSid -Name 'LAB\grp' -PrincipalType 'Group' `
+            -DistinguishedName "CN=grp,OU=Groups,$script:DomainNc"
+
+        $member1 = New-Trustee -Sid 'S-1-5-21-100-200-300-1101' -Name 'LAB\m1' -PrincipalType 'User'
+        $member2 = New-Trustee -Sid 'S-1-5-21-100-200-300-1102' -Name 'LAB\m2' -PrincipalType 'User'
+        $list    = [List[PSObject]]::new()
+        $list.Add($member1); $list.Add($member2)
+        $expansion[$script:GroupSid] = $list
+
+        $records = [List[PSObject]]::new()
+        $records.Add( (New-AceRecord -TrusteeSid $script:UserSid  -RightsDecoded 'ReadProperty') )
+        $records.Add( (New-AceRecord -TrusteeSid $script:UserSid  -RightsDecoded 'WriteProperty' -IsInherited $true) )
+        $records.Add( (New-AceRecord -TrusteeSid $script:GroupSid -RightsDecoded 'GenericAll') )
+
+        $detailPath = Join-Path $script:PivotWorkDir 'detail-recon.csv'
+        $pivotPath  = Join-Path $script:PivotWorkDir 'pivot-recon.csv'
+        $stats      = [Dictionary[string, PSObject]]::new()
+
+        $writeDetailParams = @{
+            DetailPath          = $detailPath
+            AceRecords          = $records
+            TrusteeCache        = $cache
+            GroupExpansionCache = $expansion
+            NamingContexts      = $script:NamingContexts
+            PivotStats          = $stats
+            CollectedAt         = $script:CollectedAt
+        }
+        $detailRowCount = Write-DetailCsv @writeDetailParams
+
+        # 2 user rows + 1 group ACE × 2 expanded members = 4 detail rows.
+        $detailRowCount | Should -Be 4
+
+        $pivotRowCount = Write-PivotCsv -PivotPath $pivotPath -Stats $stats `
+                                        -CollectedAt $script:CollectedAt
+        $pivotRowCount | Should -Be 3   # u1 + m1 + m2 (group itself never lands in pivot when expanded)
+
+        $sumTotalAce = 0
+        foreach ($kvp in $stats.GetEnumerator()) {
+            $sumTotalAce += $kvp.Value.TotalAceCount
+        }
+        $sumTotalAce | Should -Be $detailRowCount `
+            -Because 'pivot reconciles with detail aggregates per plan §17 scenario 4'
+    }
+}
