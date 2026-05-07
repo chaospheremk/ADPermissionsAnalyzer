@@ -138,6 +138,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1')
+
 # --- Helpers ----------------------------------------------------------------
 
 function Write-LogEvent {
@@ -260,9 +262,87 @@ try {
     Write-LogEvent @startParams
 
     # --- Phase 1: Discovery & GUID maps ------------------------------------
-    # TODO(plan §18.2): Get-ADNamingContext, New-ADExtendedRightsMap,
-    #                   New-ADSchemaGuidMap, New-PropertySetMembersMap,
-    #                   New-WellKnownSidMap.
+    $phase1Start = [DateTime]::UtcNow
+    $phase1StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase1'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 1: discovery + GUID maps.'
+    }
+    Write-LogEvent @phase1StartParams
+
+    $connectParams = @{
+        Server     = $Server
+        Domain     = $Domain
+        Credential = $Credential
+    }
+    $script:LdapConnection = Connect-AdLdap @connectParams
+
+    $namingContexts = Get-ADNamingContext -Connection $script:LdapConnection
+    foreach ($nc in $namingContexts) {
+        $ncParams = @{
+            Level     = 'INFO'
+            Phase     = 'Phase1'
+            EventName = 'NamingContextDiscovered'
+            Message   = "Naming context: $($nc.DistinguishedName) [$($nc.Type)]"
+            Data      = @{ distinguishedName = $nc.DistinguishedName; type = $nc.Type }
+        }
+        Write-LogEvent @ncParams
+    }
+
+    $configurationContext = ($namingContexts.Where({ $_.Type -eq 'Configuration' }))[0]
+    $schemaContext        = ($namingContexts.Where({ $_.Type -eq 'Schema' }))[0]
+    if (-not $configurationContext) { throw 'Configuration NC not present in RootDSE.' }
+    if (-not $schemaContext)        { throw 'Schema NC not present in RootDSE.' }
+
+    $extRightsParams = @{
+        Connection                 = $script:LdapConnection
+        ConfigurationNamingContext = $configurationContext.DistinguishedName
+        PageSize                   = $PageSize
+    }
+    $extendedRightsMap = New-ADExtendedRightsMap @extRightsParams
+
+    $schemaParams = @{
+        Connection          = $script:LdapConnection
+        SchemaNamingContext = $schemaContext.DistinguishedName
+        PageSize            = $PageSize
+    }
+    $schemaGuidMap = New-ADSchemaGuidMap @schemaParams
+
+    $propertySetMembersMap = New-PropertySetMembersMap @schemaParams
+    $wellKnownSidMap       = New-WellKnownSidMap
+
+    if ($extendedRightsMap.Count -eq 0) {
+        throw 'ExtendedRightsMap is empty — schema or permissions issue (plan §14).'
+    }
+    if ($schemaGuidMap.Count -eq 0) {
+        throw 'SchemaGuidMap is empty — schema or permissions issue (plan §14).'
+    }
+
+    $mapBuiltParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase1'
+        EventName = 'MapBuilt'
+        Message   = 'GUID and SID maps built.'
+        Data      = @{
+            extendedRights      = $extendedRightsMap.Count
+            schemaGuids         = $schemaGuidMap.Count
+            propertySets        = $propertySetMembersMap.Count
+            wellKnownSids       = $wellKnownSidMap.Count
+            namingContextCount  = $namingContexts.Count
+        }
+    }
+    Write-LogEvent @mapBuiltParams
+
+    $phase1ElapsedMs = [int] ([DateTime]::UtcNow - $phase1Start).TotalMilliseconds
+    $phase1EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase1'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 1 complete.'
+        Data      = @{ elapsedMs = $phase1ElapsedMs }
+    }
+    Write-LogEvent @phase1EndParams
 
     # --- Phase 2: Object enumeration ---------------------------------------
     # TODO(plan §18.3): Get-ADObjectAclBatch (paged S.DS.Protocols search with
@@ -322,6 +402,9 @@ catch {
     Write-Error -ErrorRecord $_ -ErrorAction Continue
 }
 finally {
+    if ($script:LdapConnection) {
+        $script:LdapConnection.Dispose()
+    }
     if ($script:LogWriter) {
         $script:LogWriter.Flush()
         $script:LogWriter.Dispose()
