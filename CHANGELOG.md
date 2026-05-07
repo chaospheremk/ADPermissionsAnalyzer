@@ -110,10 +110,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on `Expand-GroupTransitive`, and `Get-DomainSid` round-trip + empty-NC
   throw.
 
+- `scripts/lib/Phase5-InheritanceSource.ps1` — Phase 5 helpers (plan §18.6):
+  `New-AceIndex` (composite-key `Dictionary[ValueTuple[string, string,
+  uint32, guid], List[PSObject]]` keyed by `(ObjectDN-upper, TrusteeSid,
+  AccessMask, ObjectTypeGuid)` over EXPLICIT rows only; skips inherited,
+  Synthetic.Owner `AceIndex = -1`, and PARSE_ERROR `AceIndex = -2`),
+  `Get-ParentDistinguishedName` (char-by-char DN tokenizer respecting
+  `\,` / `\\` / `\HH` LDAP escapes, returns `$null` at NC root),
+  `Test-IsContainerClass` (heuristic over the small set of AD container
+  classes), `Test-InheritanceFlagsPropagateTo` (pure rule over
+  `AceFlagsRaw` byte + `InheritedObjectTypeName` + descendant class +
+  `IsDirectChild`; encodes ContainerInherit / ObjectInherit container-vs-leaf
+  gating, NoPropagateInherit level-1-only halt, InheritOnly transparent for
+  descendants, InheritedObjectType class filter via OI string equality),
+  `Resolve-InheritanceSource` (mutates `$aceRecords` in place — adds
+  `InheritanceSourceDN` and `InheritanceSourceNote` columns on every row;
+  DACL_PROTECTED short-circuits to `InconsistentProtectedDacl` and emits
+  the anomaly into `-ProtectedDaclAnomalies`; otherwise walks the parent
+  chain via `Get-ParentDistinguishedName`, direct-lookup at each ancestor,
+  first matching candidate wins; `SchemaDefaultOrUnresolved` fallback;
+  stops at NC root or beyond; returns stats record with `Indexed`,
+  `InheritedTotal`, `Resolved`, `Unresolved`, `ProtectedDacl`).
+- Phase 5 wired into `Invoke-ADPermissionAnalysis.ps1`: runs single-threaded
+  after Phase 4 `PhaseEnd`. Builds the index, extracts NC DNs into a
+  `List[string]`, calls `Resolve-InheritanceSource` with an anomaly sink,
+  forwards each `InheritedAceOnProtectedDacl` anomaly to `Write-LogEvent`
+  at WARN with `EventName = 'BatchError'` (matches Phase 3's BatchError
+  contract from §13) AND adds it to `$script:ErrorBag` so the §14
+  exit-code-2 path picks them up. `PhaseStart` / `PhaseEnd` events emit
+  per plan §13 with `indexed` / `inheritedTotal` / `resolved` /
+  `unresolved` / `protectedDacl` counts.
+- `Tests/Phase5-InheritanceSource.Tests.ps1` — Pester suite (24 cases)
+  covering `New-AceIndex` (explicit-only indexing, inherited skip,
+  Synthetic.Owner / PARSE_ERROR skip, composite-key collision stacking),
+  `Get-ParentDistinguishedName` (standard DN, escaped-comma RDN value,
+  NC root → null, empty input → null), `Test-InheritanceFlagsPropagateTo`
+  (ContainerInherit/ObjectInherit container-vs-leaf gating in both
+  directions, InheritOnly transparent for descendants, NoPropagateInherit
+  level-1-only halt, InheritedObjectType class filter user/group, no
+  inherit flags returns false), and `Resolve-InheritanceSource`
+  end-to-end (direct-parent resolution, two-level walk past failing-flag
+  level-1 candidate, DACL_PROTECTED short-circuit + anomaly emission,
+  `SchemaDefaultOrUnresolved` fallback, explicit rows un-mutated, and
+  Synthetic.Owner / PARSE_ERROR rows still get the columns added with
+  empty values for uniform Phase 6 schema).
+
 ### Changed
 
 - `Invoke-PagedLdapSearch` is now a materialising thin wrapper over a new
   streaming `Read-LdapEntry` primitive that supports `-AdditionalControls`.
   Phase 1 callers and their test mocks are unchanged.
+- Phase 5 is the FIRST phase that mutates `$aceRecords` — every row gains
+  `InheritanceSourceDN` (default `$null`) and `InheritanceSourceNote`
+  (default `''`) note properties so the Phase 6 detail-CSV schema is
+  uniform across explicit / inherited / Synthetic.Owner / PARSE_ERROR
+  rows. Earlier phases were producers or pure consumers.
 
 ### Fixed
