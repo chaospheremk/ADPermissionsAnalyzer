@@ -203,6 +203,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Explicit vs Inherited / DistinctObjectDns / RightsBreakdown — across a
   4-row fixture mixing direct and group-expanded trustees).
 
+- `scripts/lib/Phase6-Output.ps1` — Phase 6 pivot CSV writer (plan §18.8):
+  `$script:Phase6PivotColumns` (16-column source of truth shared by header
+  + body), `Format-RightsSummary` / `Format-ObjectClassesTouched` (count
+  desc, name asc tiebreak — `"GenericAll:42; WriteProperty:118;
+  ReadProperty:980"` shape; empty / null dict → `''`),
+  `Format-NamingContextsTouched` (sorted ordinal-ignore-case, joined with
+  `;` — `"Configuration;Domain;Schema"`), `ConvertTo-PivotRow` (pure
+  transform: PivotStats bucket + CollectedAt → 16 escaped fields in
+  plan-§11 pivot order; `DistinctObjectCount` is the bucket's
+  `DistinctObjectDns.Count`), `Write-PivotCsv` (orchestrator: opens its
+  own `[StreamWriter]` UTF-8 no-BOM `AutoFlush = $false`, sorts buckets
+  by TotalAceCount desc → EffectiveTrusteeName asc → SID asc, writes
+  header + one row per bucket via `ConvertTo-PivotRow`, returns row
+  count).
+- Phase 6 pivot wired into `Invoke-ADPermissionAnalysis.ps1`: emits a
+  fresh `Phase6 / PivotStart` and `Phase6 / PivotEnd` JSONL pair so the
+  detail-write and pivot-write phases are distinguishable in the log;
+  `PivotEnd.data` carries `pivotRowCount` + `elapsedMs`.
+- `Tests/Phase6-Output.Tests.ps1` — extended Pester suite (now 31 cases)
+  with: `Format-RightsSummary` (empty / `$null` → `''`, count-desc sort
+  with `name-asc` tiebreak), `Format-NamingContextsTouched` (empty /
+  `$null`, ordinal-ignore-case ascending join), `Format-ObjectClassesTouched`
+  (sort + tiebreak), `ConvertTo-PivotRow` (16 columns in plan-§11 order;
+  scalar counts plus the three formatted summaries; `DistinctObjectCount`
+  derives from `DistinctObjectDns.Count`), and `Write-PivotCsv` end-to-end
+  (3-bucket fixture sorted by activity desc, `Import-Csv` round-trip,
+  `RightsSummary` with embedded `,` and `;` round-trips correctly, and a
+  reconciliation case asserting that `sum(stats[*].TotalAceCount)` over
+  the pivot equals `Write-DetailCsv`'s returned row count — plan §17
+  smoke-test scenario 4).
+
 ### Changed
 
 - `Invoke-PagedLdapSearch` is now a materialising thin wrapper over a new
