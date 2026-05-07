@@ -42,6 +42,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`byte[]` SD passthrough, GUID conversion, structuralObjectClass fallback,
   DN preservation), and LDAP request shape (control mask, binary attributes,
   scope/filter).
+- `scripts/lib/Phase3-AceParsing.ps1` — Phase 3 helpers (plan §18.4):
+  `ConvertFrom-NtSecurityDescriptor` (Owner + DACL + IsDaclProtected from
+  `ActiveDirectorySecurity.AreAccessRulesProtected`), `Add-OwnerAce` (synthetic
+  Owner row with `AceIndex = -1`, `RightsDecoded = 'OwnerImplicit'`,
+  `AccessMask = 0xE0000`), `ConvertFrom-AdAce` (rights ToString comma-decompose,
+  ObjectTypeKind classifier across the three GUID maps per plan §7,
+  AceFlagsRaw composition from inheritance + propagation + IsInherited),
+  `Invoke-AceParsingWorkUnit` (per-object SD parse with `AceIndex = -2`
+  PARSE_ERROR placeholder isolation), `New-RunspacePool`
+  (`InitialSessionState` carries GUID maps via `SessionStateVariableEntry`
+  + lib file via `iss.StartupScripts`), `Invoke-RunspacePoolWork` (dispatcher
+  with per-batch `BatchError` capture into `-ErrorBag`).
+- Phase 3 wired into `Invoke-ADPermissionAnalysis.ps1`: pool created before
+  Phase 2 enumeration, batches dispatched as they arrive (pipelined
+  enumeration + parsing per plan §12), drained after `Phase2EndPhaseEnd`
+  emits, BatchError logged via `Write-LogEvent` and aggregated into
+  `$script:ErrorBag`. `Phase3PhaseStart` / `PhaseEnd` events carry batch
+  count + ACE total (plan §13).
+- `Tests/Phase3-AceParsing.Tests.ps1` — Pester suite (32 cases) covering
+  Owner parsing, IsDaclProtected detection (set + unset), synthetic Owner ACE
+  shape, GenericAll comma-decomposed RightsDecoded, all five ObjectTypeKind
+  classifications (Property / PropertySet / ExtendedRight / ClassChild /
+  All / Unresolved), AceType naming
+  (AccessAllowed/AccessDenied/AccessAllowedObject/AccessDeniedObject),
+  AceIndex preservation, AceFlagsRaw composition, IsDaclProtected
+  propagation, work-unit owner+DACL emission, PARSE_ERROR placeholder
+  isolation, runspace pool aggregation, BatchError capture, variable
+  injection, and StartupScripts dot-source.
 
 ### Changed
 

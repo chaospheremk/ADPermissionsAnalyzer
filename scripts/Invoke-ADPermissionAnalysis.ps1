@@ -138,8 +138,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1')
-. (Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1')
+$script:Phase1LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1'
+$script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1'
+$script:Phase3LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase3-AceParsing.ps1'
+
+. $script:Phase1LibPath
+. $script:Phase2LibPath
+. $script:Phase3LibPath
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -359,8 +364,41 @@ try {
     $progressIntervalObjects = 5000
     $totalObjects = 0
 
-    # Phase 3 (Step 4) will hook into the per-batch foreach below to dispatch
-    # to the runspace pool. For now we only count and emit progress.
+    # --- Phase 3 setup: pool + work unit are ready before enumeration so we
+    #     can pipeline batches into the pool as they arrive (plan §12).
+    $phase3Start = [DateTime]::UtcNow
+    $phase3StartParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase3'
+        EventName = 'PhaseStart'
+        Message   = 'Phase 3: ACE parsing (runspace pool dispatch).'
+        Data      = @{ threadCount = $ThreadCount }
+    }
+    Write-LogEvent @phase3StartParams
+
+    $poolParams = @{
+        ThreadCount    = $ThreadCount
+        Variables      = @{
+            ExtendedRightsMap = $extendedRightsMap
+            SchemaGuidMap     = $schemaGuidMap
+        }
+        StartupScripts = @($script:Phase3LibPath)
+    }
+    $script:Phase3Pool = New-RunspacePool @poolParams
+
+    $workUnit = {
+        param([System.Collections.Generic.List[PSObject]] $Batch)
+        $params = @{
+            Batch             = $Batch
+            ExtendedRightsMap = $ExtendedRightsMap
+            SchemaGuidMap     = $SchemaGuidMap
+        }
+        Invoke-AceParsingWorkUnit @params
+    }
+
+    $handles    = [System.Collections.Generic.List[PSObject]]::new()
+    $aceRecords = [System.Collections.Generic.List[PSObject]]::new()
+
     foreach ($nc in $selectedNcs) {
         $ncStart           = [DateTime]::UtcNow
         $ncObjectCount     = 0
@@ -377,7 +415,16 @@ try {
             $ncObjectCount     += $batch.Count
             $totalObjects      += $batch.Count
             $sinceLastProgress += $batch.Count
-            # TODO(Step 4): dispatch $batch to the Phase 3 runspace pool.
+
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $script:Phase3Pool
+            [void] $ps.AddScript($workUnit).AddArgument($batch)
+            $handles.Add([PSCustomObject]@{
+                PowerShell    = $ps
+                Handle        = $ps.BeginInvoke()
+                NamingContext = $nc.DistinguishedName
+                BatchSize     = $batch.Count
+            })
 
             if ($sinceLastProgress -ge $progressIntervalObjects) {
                 $progressParams = @{
@@ -446,10 +493,55 @@ try {
     }
     Write-LogEvent @phase2EndParams
 
-    # --- Phase 3: ACE parsing (runspace pool) ------------------------------
-    # TODO(plan §18.4): ConvertFrom-NtSecurityDescriptor, Add-OwnerAce,
-    #                   ConvertFrom-AdAce, Invoke-AceParsingWorkUnit,
-    #                   New-RunspacePool, Invoke-RunspacePoolWork.
+    # --- Phase 3 drain: collect parsed ACE records from queued runspaces ---
+    foreach ($h in $handles) {
+        try {
+            $batchResult = $h.PowerShell.EndInvoke($h.Handle)
+            foreach ($r in $batchResult) {
+                $aceRecords.Add($r)
+            }
+        }
+        catch {
+            $errorRecord = [PSCustomObject]@{
+                Event         = 'BatchError'
+                Phase         = 'Phase3'
+                NamingContext = $h.NamingContext
+                BatchSize     = $h.BatchSize
+                Error         = $_.Exception.Message
+            }
+            $script:ErrorBag.Add($errorRecord)
+
+            $batchErrParams = @{
+                Level     = 'WARN'
+                Phase     = 'Phase3'
+                EventName = 'BatchError'
+                Message   = "Phase 3 batch failed: $($_.Exception.Message)"
+                Data      = @{
+                    namingContext = $h.NamingContext
+                    batchSize     = $h.BatchSize
+                }
+            }
+            Write-LogEvent @batchErrParams
+        }
+        finally {
+            $h.PowerShell.Dispose()
+        }
+    }
+
+    $phase3ElapsedMs = [int] ([DateTime]::UtcNow - $phase3Start).TotalMilliseconds
+    $phase3EndParams = @{
+        Level     = 'INFO'
+        Phase     = 'Phase3'
+        EventName = 'PhaseEnd'
+        Message   = 'Phase 3 complete.'
+        Data      = @{
+            totalObjects = $totalObjects
+            totalAces    = $aceRecords.Count
+            batchCount   = $handles.Count
+            elapsedMs    = $phase3ElapsedMs
+        }
+    }
+    Write-LogEvent @phase3EndParams
 
     # --- Phase 4: Trustee resolution & group expansion ---------------------
     # TODO(plan §18.5): Resolve-TrusteeSid, Expand-GroupTransitive,
@@ -500,6 +592,10 @@ catch {
     Write-Error -ErrorRecord $_ -ErrorAction Continue
 }
 finally {
+    if ($script:Phase3Pool) {
+        try { $script:Phase3Pool.Close() } catch { $null = $_ }
+        $script:Phase3Pool.Dispose()
+    }
     if ($script:LdapConnection) {
         $script:LdapConnection.Dispose()
     }
