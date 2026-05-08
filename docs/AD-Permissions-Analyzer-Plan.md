@@ -574,18 +574,20 @@ These were not raised during planning. Implementation may proceed with the noted
 
 ---
 
-## 17. Validation / Smoke Tests
+## 17. Validation
 
-Not full Pester coverage (out of scope per "pure inventory snapshot"), but the implementation should include at minimum:
+No live-LDAP smoke run is in scope: there is no lab DC available to this project. End-to-end validation against a real directory and the 30k-object performance pass are removed deliverables, not deferred ones. If a lab DC becomes available later, validation can be re-added as a new section and as additional steps in §18 — but until then, the implementation's correctness rests entirely on the Pester unit suites attached to each phase.
 
-1. Run against a small lab OU with known ACEs (e.g., grant `Test-User` `WriteProperty` on a specific OU) and verify the row appears in detail CSV with correct decoding.
-2. Verify a known nested-group ACE expands correctly (e.g., `Tier0-Admins` granted `GenericAll`, with `Helpdesk-Admins` nested inside).
-3. Verify an inherited default schema ACE (e.g., on a fresh user object) is captured with `IsInherited = true` and either a resolved `InheritanceSourceDN` or `SchemaDefaultOrUnresolved`.
-4. Verify pivot row counts reconcile with detail row aggregates.
-5. Run on a 30k-object domain and confirm completion within an acceptable window (target: < 30 minutes on an 8-core admin workstation; not a hard SLA).
-6. **Property-set decoding:** grant a known property-set ACE (e.g., `WriteProperty` on the `Phone-and-Mail-Options` property set on a test user) and verify: `ObjectTypeKind = 'PropertySet'`, `ObjectTypeName = 'Phone-and-Mail-Options'`, and the log shows the member attributes resolved from `PropertySetMembersMap`.
-7. **Owner capture:** set the owner of a test OU to a known principal (e.g., `Test-Owner-User`) and verify a row appears in detail CSV with `AceType = 'Synthetic.Owner'`, `AceTrusteeSid = <Test-Owner-User SID>`, `RightsDecoded = 'OwnerImplicit'`, and `AceIndex = -1`.
-8. **DACL_PROTECTED:** create a test OU with DACL inheritance disabled (Properties → Security → Advanced → Disable inheritance → Convert) and verify all rows for that OU show `IsDaclProtected = $true` and that none have `IsInherited = $true`. Log should NOT contain `InheritedAceOnProtectedDacl` for this OU (a clean test case).
+The unit suites that ship with the implementation cover, at the helper-function level:
+
+- Phase 1: GUID-map builders (Extended-Rights, Schema, PropertySet members) and well-known SID map.
+- Phase 2: paged-search shape, batch boundaries, raw-byte SD passthrough, GUID conversion, `structuralObjectClass` fallback.
+- Phase 3: SD parsing, synthetic Owner row shape, RightsDecoded composition, all five `ObjectTypeKind` classifications, `AceFlagsRaw` composition, PARSE_ERROR isolation, runspace-pool aggregation, BatchError capture.
+- Phase 4: trustee resolution cascade (cache → Translate → WellKnownSid → FSP → Orphan), well-known SID skip-set, in-chain group expansion with cycle/cap behaviour.
+- Phase 5: composite-key index over explicit rows only, escape-aware `Get-ParentDistinguishedName`, `Test-InheritanceFlagsPropagateTo` flag-bit + class-filter rule, `Resolve-InheritanceSource` direct-parent / level-2 walk / DACL_PROTECTED short-circuit / `SchemaDefaultOrUnresolved` fallback.
+- Phase 6: RFC-4180 escape, Detail-CSV column shape, Synthetic.Owner / PARSE_ERROR / inherited row passthrough, group fan-out, NC-label longest-suffix match, pivot accumulator counters, pivot summary formatters with sort tiebreaks, full pivot/detail reconciliation on a fixture (`sum(stats[*].TotalAceCount) == row count`).
+
+Anything that depends on real-directory state — schema-default ACE handling on a fresh user, DACL_PROTECTED + Convert anomaly behaviour, transitive expansion correctness on real nested groups, property-set name resolution for a real PropertySetMembersMap, throughput on a 30k-object domain — is **uncovered** by this plan. The script's behaviour on those cases is asserted by the unit suites against fabricated SDs; behaviour on real SDs is unverified. Operators running this against a production directory should treat the first run as exploratory and review the JSONL log for `BatchError` / `PARSE_ERROR` / `OrphanSid` / `InheritedAceOnProtectedDacl` events before acting on the CSV output.
 
 ---
 
@@ -601,20 +603,7 @@ Build in this sequence so each phase is independently testable:
 6. Phase 5: Inheritance source resolution with composite-key index + DACL_PROTECTED short-circuit
 7. Phase 6: Detail CSV writer (streaming, with `AceIndex` and `IsDaclProtected` columns and `Synthetic.Owner` rows)
 8. Phase 6: Pivot CSV writer (built incrementally during detail streaming via `$PivotStats`)
-9. End-to-end smoke run on lab domain
-10. Performance pass (only if needed) on 30k-object domain
 
 Do not skip ahead. Each phase commits independently.
 
-### Step ↔ smoke-test scenario mapping (§17)
-
-| Step                                                    | Scenarios it satisfies               |
-|---------------------------------------------------------|--------------------------------------|
-| 4 (ACE parsing single-thread + Owner + DACL_PROTECTED)  | 1, 6, 7, 8                          |
-| 5 (Trustee resolution + group expansion)                | 2                                    |
-| 6 (Inheritance source)                                  | 3                                    |
-| 7 (Detail CSV writer)                                   | 1, 2, 3, 6, 7, 8 — column verification |
-| 8 (Pivot CSV writer)                                    | 4 (pivot reconciles with detail aggregates) |
-| 10 (Performance pass)                                   | 5 (30k-object completion within window) |
-
-This mapping makes coverage incremental: by step 7 the implementation has end-to-end coverage of seven of the eight smoke scenarios; only the perf scenario remains.
+Step 8 is the final implementation step. There is no end-to-end smoke run and no 30k-object performance pass — both required a lab DC that is not available to this project (see §17). If lab access becomes available later, those validations would be additive new steps; they are not preconditions for considering the implementation complete.

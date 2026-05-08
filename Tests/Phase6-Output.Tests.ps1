@@ -768,10 +768,11 @@ Describe 'Write-PivotCsv' {
             Should -Be 'Weird,Right:4; Other;Right:3; ReadProperty:3'
     }
 
-    It 'pivot TotalAceCount sums equal Write-DetailCsv row count (scenario 4 reconciliation)' {
+    It 'pivot TotalAceCount sums equal Write-DetailCsv row count' {
         # Build a fresh detail-CSV run so the pivot is the live accumulator,
-        # not a hand-built fixture. Plan §17 scenario 4: pivot reconciles with
-        # detail aggregates.
+        # not a hand-built fixture. The invariant under test: pivot reconciles
+        # with detail aggregates — sum of every bucket's TotalAceCount equals
+        # the detail row count emitted by Write-DetailCsv.
         $cache = [Dictionary[string, PSObject]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
         $expansion = [Dictionary[string, List[PSObject]]]::new(
@@ -819,6 +820,6 @@ Describe 'Write-PivotCsv' {
             $sumTotalAce += $kvp.Value.TotalAceCount
         }
         $sumTotalAce | Should -Be $detailRowCount `
-            -Because 'pivot reconciles with detail aggregates per plan §17 scenario 4'
+            -Because 'pivot reconciles with detail aggregates'
     }
 }
