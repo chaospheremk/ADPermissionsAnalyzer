@@ -231,8 +231,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (3-bucket fixture sorted by activity desc, `Import-Csv` round-trip,
   `RightsSummary` with embedded `,` and `;` round-trips correctly, and a
   reconciliation case asserting that `sum(stats[*].TotalAceCount)` over
-  the pivot equals `Write-DetailCsv`'s returned row count — plan §17
-  smoke-test scenario 4).
+  the pivot equals `Write-DetailCsv`'s returned row count).
 
 ### Changed
 
@@ -244,5 +243,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (default `''`) note properties so the Phase 6 detail-CSV schema is
   uniform across explicit / inherited / Synthetic.Owner / PARSE_ERROR
   rows. Earlier phases were producers or pure consumers.
+- Plan §17 (Validation / Smoke Tests) and §18 steps 9–10 (lab smoke run +
+  30k-object performance pass) removed: no lab DC is available to this
+  project, so live-LDAP validation is out of scope. The implementation
+  ends at §18 step 8 (Phase 6 pivot CSV writer); correctness rests on the
+  Pester unit suites attached to each phase. See ADR-025.
 
 ### Fixed
