@@ -20,8 +20,8 @@ using namespace System.Text
         tests mock at that single boundary.
 
     Phase 4 runs single-threaded over $aceRecords and never mutates them;
-    Phase 6 (Step 7) is the consumer that joins each ACE to its effective
-    trustees while streaming the detail CSV.
+    Phase 6 is the consumer that joins each ACE to its effective trustees
+    while streaming the detail CSV.
 #>
 
 function Resolve-NTAccount {

@@ -257,5 +257,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `91.22%` per ADR-026 — high enough to lock in current coverage as a
   regression gate, low enough that a single new untested helper doesn't
   break CI.
+- `scripts/Invoke-ADPermissionAnalysis.ps1` `.DESCRIPTION` rewritten to
+  reflect the shipped six-phase orchestration. Previous text framed the
+  script as a "skeleton entry point" with phase bodies pending §18.2-§18.8
+  — true at PR #9, stale since Step 8 (PR #16). Behaviour unchanged.
+- `scripts/lib/Phase6-Output.ps1` `.SYNOPSIS` / `.DESCRIPTION` and
+  `Write-DetailCsv` per-function help: replaced "Step 8 will serialise" /
+  "Step 8 needs no second pass" / "Step 8's Pivot CSV writer consumes
+  this" with `Write-PivotCsv` references. Behaviour unchanged.
+- `scripts/lib/Phase4-TrusteeResolution.ps1` `.DESCRIPTION`: dropped the
+  stale "(Step 7)" parenthetical pointing at Phase 6's consumer role.
+- `docs/index.md`: dropped the "(pre-refinement)" qualifier on the plan
+  link — the plan was refined in PR #8 and again in PR #17.
+- `Export-ScriptDocumentation.ps1` example splitter: track brace/paren
+  depth and a sticky multi-line flag so multi-line splat hashtables (the
+  house-style 3+ parameter idiom) round-trip correctly into the
+  generated `## Examples` section. Previously the splat opener was
+  treated as the only command line and every subsequent line collapsed
+  into the description, producing a malformed Example 2 block on
+  `Invoke-ADPermissionAnalysis.md`.
 
 ### Fixed
