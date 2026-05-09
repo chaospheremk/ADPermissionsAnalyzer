@@ -248,5 +248,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   project, so live-LDAP validation is out of scope. The implementation
   ends at §18 step 8 (Phase 6 pivot CSV writer); correctness rests on the
   Pester unit suites attached to each phase. See ADR-025.
+- `build.config.psd1`: `CoveragePaths` narrowed from `'scripts'` to
+  `'scripts/lib'` and `CoverageThreshold` raised from `0` to `86`.
+  Coverage now scopes to the unit-testable lib surface only — entry
+  script and `Install-GitHooks.ps1` are excluded as
+  integration-test / utility surface (see ADR-025 for the entry script's
+  testability rationale). `86` is 5pp below the measured lib floor of
+  `91.22%` per ADR-026 — high enough to lock in current coverage as a
+  regression gate, low enough that a single new untested helper doesn't
+  break CI.
 
 ### Fixed
