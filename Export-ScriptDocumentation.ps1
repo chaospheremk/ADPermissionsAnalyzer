@@ -403,25 +403,41 @@ foreach ($File in $ScriptFiles) {
 
             # Split example text into code and description.
             # First contiguous block of lines is code; rest is description.
+            # Multi-line splats (@{ ... }), pipe/backtick continuations, and
+            # parameter lines all keep accumulating into the command block.
+            # Once a multi-line block has started, the blank line that follows
+            # the closing brace is the divider, not the next non-prose-shaped
+            # line — so we stay in command mode until that blank.
             $ExLines = $ExText -split "`n"
             $CommandLines = [System.Collections.Generic.List[string]]::new()
             $DescLines = [System.Collections.Generic.List[string]]::new()
             $StillInCommand = $true
+            $BraceDepth = 0
+            $EverNested = $false
 
             foreach ($ExLine in $ExLines) {
                 $LineTrimmed = $ExLine.Trim()
                 if (-not $LineTrimmed) {
-                    $StillInCommand = $false
+                    if ($BraceDepth -le 0) { $StillInCommand = $false }
                     continue
                 }
                 if ($StillInCommand) {
-                    if ($CommandLines.Count -eq 0) {
+                    $InCommand = ($CommandLines.Count -eq 0) -or
+                                 ($BraceDepth -gt 0) -or
+                                 $EverNested -or
+                                 $CommandLines[-1].EndsWith('`') -or
+                                 $CommandLines[-1].EndsWith('|') -or
+                                 $LineTrimmed.StartsWith('-') -or
+                                 $LineTrimmed.StartsWith('|')
+                    if ($InCommand) {
                         $CommandLines.Add($LineTrimmed)
-                    } elseif ($CommandLines[-1].EndsWith('`') -or
-                              $CommandLines[-1].EndsWith('|') -or
-                              $LineTrimmed.StartsWith('-') -or
-                              $LineTrimmed.StartsWith('|')) {
-                        $CommandLines.Add($LineTrimmed)
+                        # Naive brace-depth tracking — sufficient for typical
+                        # help examples; would over/undercount for unbalanced
+                        # braces inside string literals.
+                        $Opens = ($LineTrimmed.ToCharArray().Where({ $_ -in '{','(','[' })).Count
+                        $Closes = ($LineTrimmed.ToCharArray().Where({ $_ -in '}',')',']' })).Count
+                        $BraceDepth += ($Opens - $Closes)
+                        if ($BraceDepth -gt 0) { $EverNested = $true }
                     } else {
                         $StillInCommand = $false
                         $DescLines.Add($LineTrimmed)

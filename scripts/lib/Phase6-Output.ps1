@@ -6,16 +6,16 @@ using namespace System.Text
 <#
 .SYNOPSIS
     Phase 6 helpers for AD Permissions Analyzer: streaming detail CSV writer
-    plus the (ACE x effective-trustee) join, RFC-4180 field escaper, and the
-    incremental pivot accumulator that Step 8 will serialise.
+    plus the (ACE x effective-trustee) join, RFC-4180 field escaper, the
+    incremental pivot accumulator, and the pivot CSV writer.
 
 .DESCRIPTION
     Implements §11 / §12 from docs/AD-Permissions-Analyzer-Plan.md. The detail
     CSV is written via a [StreamWriter] with manual escaping rather than
     Export-Csv — pipeline overhead at a worst-case ~5M rows would dominate
     runtime. Pivot statistics accumulate per emitted detail row into the
-    supplied -PivotStats dictionary so Step 8 needs no second pass over
-    $aceRecords.
+    supplied -PivotStats dictionary, then Write-PivotCsv consumes the
+    populated dictionary directly with no second pass over $aceRecords.
 
     Phase 6 is the first phase whose hot loop runs once per (ACE x effective
     trustee) tuple — at the design ceiling that's ~5M iterations. The
@@ -498,7 +498,7 @@ function Write-DetailCsv {
         in -AceRecords expands into one or more (effective trustee, path,
         IsThroughGroup) tuples via Get-EffectiveTrusteeRecord and writes
         one row per tuple. Each emitted tuple updates the -PivotStats
-        dictionary so Step 8 can serialise without a second pass.
+        dictionary so Write-PivotCsv can serialise without a second pass.
 
         -ProgressCallback (optional scriptblock) fires every
         -ProgressInterval rows with the running tuple count + elapsed ms;
@@ -528,7 +528,8 @@ function Write-DetailCsv {
 
     .PARAMETER PivotStats
         Mutable dictionary the function populates as a side effect.
-        Step 8's Pivot CSV writer consumes this.
+        Write-PivotCsv consumes this directly with no second pass over
+        -AceRecords.
 
     .PARAMETER CollectedAt
         UTC ISO-8601 timestamp string for the run.

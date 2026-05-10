@@ -9,17 +9,22 @@ using namespace System.Text
     Active Directory domain, across all naming contexts, for least-privilege analysis.
 
 .DESCRIPTION
-    Skeleton entry point for the AD Permissions Analyzer.
+    Entry point for the AD Permissions Analyzer. Orchestrates all six phases per
+    docs/AD-Permissions-Analyzer-Plan.md §3 by dot-sourcing scripts/lib/Phase[1-6]-*.ps1
+    and wiring the per-phase JSONL events from §13:
 
-    This step (plan §18.1) wires the parameter surface, the JSONL logging primitive,
-    and the top-level execution skeleton. Subsequent steps (§18.2-§18.8) populate the
-    six phases: discovery + GUID maps, enumeration, ACE parsing, trustee resolution,
-    inheritance source resolution, and CSV output.
+      Phase 1 — LDAP bind + naming-context discovery + GUID/SID maps (§5, §8)
+      Phase 2 — paged enumeration with SecurityDescriptorFlagControl(OWNER | DACL)
+      Phase 3 — ACE parsing in a runspace pool (synthetic Owner + IsDaclProtected)
+      Phase 4 — trustee resolution + transitive group expansion + skip-set
+      Phase 5 — inheritance-source resolution via composite-key index
+      Phase 6 — streaming detail CSV + incremental pivot accumulator + pivot CSV
 
-    The full implementation specification is in
-    docs/AD-Permissions-Analyzer-Plan.md. House style (foreach, .Where({}), typed
+    Outputs two CSVs (per-ACE detail, per-trustee pivot) and a JSONL log to
+    -OutputDirectory. Exit code 0 on success, 1 on unrecoverable fault, 2 on
+    success-with-warnings (per §14). House style — foreach, .Where({}), typed
     collections, CmdletBinding, structured JSONL logging, no Set-StrictMode, no
-    ForEach-Object, no Where-Object) is mandatory throughout.
+    ForEach-Object, no Where-Object — applies throughout.
 
 .PARAMETER Domain
     FQDN of the target domain. Default: the current user's domain (resolved at runtime).
