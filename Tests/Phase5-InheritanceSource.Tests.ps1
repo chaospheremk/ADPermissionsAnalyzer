@@ -333,6 +333,49 @@ Describe 'Resolve-InheritanceSource' {
         $records[0].InheritanceSourceDN | Should -Be $script:DomainNc
     }
 
+    It 'stops the parent walk at the Configuration NC root and does not cross into the Domain NC' {
+        # An inherited row inside the Configuration NC must resolve from
+        # within Configuration only — never from an explicit ACE on the
+        # Domain NC root. The Domain-root ACE here is a trap: if the walk
+        # crosses the NC boundary it would resolve incorrectly to that row.
+        $configNc = "CN=Configuration,$script:DomainNc"
+        $nc       = @($configNc, $script:DomainNc)
+
+        $records = [List[PSObject]]::new()
+
+        # Inherited descendant inside the Configuration NC.
+        $records.Add( (New-AceRow `
+            -ObjectDN "CN=Sites,$configNc" `
+            -ObjectClass 'sitesContainer' `
+            -TrusteeSid $script:TrusteeSid `
+            -AccessMask $script:Mask `
+            -IsInherited $true `
+            -AceIndex 0) )
+
+        # Trap: an explicit ACE on the Domain NC root with a matching
+        # composite key (same trustee + access mask + ContainerInherit).
+        # If the walk crossed into Domain NC, this would be picked up.
+        $records.Add( (New-AceRow `
+            -ObjectDN $script:DomainNc `
+            -ObjectClass 'domainDNS' `
+            -TrusteeSid $script:TrusteeSid `
+            -AccessMask $script:Mask `
+            -AceIndex 0 `
+            -AceFlagsRaw $script:AfContainer) )
+
+        $index = New-AceIndex -AceRecords $records
+        $stats = Resolve-InheritanceSource `
+            -AceRecords $records `
+            -AceIndex $index `
+            -NamingContextDistinguishedNames $nc
+
+        $stats.InheritedTotal | Should -Be 1
+        $stats.Resolved        | Should -Be 0
+        $stats.Unresolved      | Should -Be 1
+        $records[0].InheritanceSourceDN   | Should -BeNullOrEmpty
+        $records[0].InheritanceSourceNote | Should -Not -BeNullOrEmpty
+    }
+
     It 'short-circuits a DACL_PROTECTED inherited row and emits an anomaly' {
         $records = [List[PSObject]]::new()
         $records.Add( (New-AceRow `

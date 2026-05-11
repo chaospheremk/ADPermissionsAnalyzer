@@ -493,6 +493,144 @@ function New-RunspacePool {
     , $pool
 }
 
+function Submit-RunspaceWorkItem {
+    <#
+    .SYNOPSIS
+        Submit a single work item to an opened runspace pool and return a
+        handle for later draining.
+
+    .DESCRIPTION
+        Creates a [powershell] pipeline bound to -Pool, adds -WorkUnit as
+        the script and -Item as its positional argument, then BeginInvokes.
+        Returns a PSCustomObject {PowerShell, Handle, Item, Index, Metadata}
+        that Receive-RunspaceHandle accepts.
+
+        Extracted from Invoke-RunspacePoolWork (plan §12) so the entry
+        script can pipeline Phase 2 batches into the Phase 3 pool as they
+        arrive — Phase 3 parsing starts while Phase 2 is still enumerating.
+
+    .PARAMETER Pool
+        Opened RunspacePool from New-RunspacePool.
+
+    .PARAMETER WorkUnit
+        ScriptBlock invoked once per input. Receives -Item as its only
+        positional argument.
+
+    .PARAMETER Item
+        The single work-unit input.
+
+    .PARAMETER Index
+        Numeric index of this item among its siblings, recorded on the
+        handle. Default 0.
+
+    .PARAMETER Metadata
+        Optional hashtable passed through to the handle; Receive-RunspaceHandle
+        forwards it onto BatchError records so callers can correlate failures
+        back to per-item context (NamingContext, BatchSize, etc.).
+    #>
+    [CmdletBinding()]
+    [OutputType([PSObject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [System.Management.Automation.Runspaces.RunspacePool] $Pool,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [scriptblock] $WorkUnit,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        $Item,
+
+        [Parameter()]
+        [int] $Index = 0,
+
+        [Parameter()]
+        [hashtable] $Metadata
+    )
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $Pool
+    [void] $ps.AddScript($WorkUnit).AddArgument($Item)
+    [PSCustomObject]@{
+        PowerShell = $ps
+        Handle     = $ps.BeginInvoke()
+        Item       = $Item
+        Index      = $Index
+        Metadata   = $Metadata
+    }
+}
+
+function Receive-RunspaceHandle {
+    <#
+    .SYNOPSIS
+        Drain a list of submitted runspace handles, aggregating results and
+        capturing per-handle failures to -ErrorBag without throwing.
+
+    .DESCRIPTION
+        Iterates -Handles (PSObjects emitted by Submit-RunspaceWorkItem),
+        calls EndInvoke on each, and appends pipeline output to the result
+        list. Per-handle exceptions become BatchError records on -ErrorBag
+        (Event, Index, Error, Metadata) without re-throwing — a single bad
+        batch never aborts the run (plan §14). Non-terminating errors left
+        on the pipeline's Streams.Error are captured the same way. Always
+        disposes the underlying [powershell] pipeline.
+
+    .PARAMETER Handles
+        List[PSObject] of handle records from Submit-RunspaceWorkItem.
+
+    .PARAMETER ErrorBag
+        Optional sink for BatchError records. The List[PSObject] is the
+        script-scoped $ErrorBag in production.
+    #>
+    [CmdletBinding()]
+    [OutputType([List[PSObject]])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [List[PSObject]] $Handles,
+
+        [Parameter()]
+        [List[PSObject]] $ErrorBag
+    )
+
+    $results = [List[PSObject]]::new()
+    foreach ($h in $Handles) {
+        try {
+            $output = $h.PowerShell.EndInvoke($h.Handle)
+            foreach ($o in $output) {
+                $results.Add($o)
+            }
+            if ($null -ne $ErrorBag -and $h.PowerShell.Streams.Error.Count -gt 0) {
+                foreach ($err in $h.PowerShell.Streams.Error) {
+                    $ErrorBag.Add([PSCustomObject]@{
+                        Event    = 'BatchError'
+                        Index    = $h.Index
+                        Error    = $err.Exception.Message
+                        Metadata = $h.Metadata
+                    })
+                }
+            }
+        }
+        catch {
+            if ($null -ne $ErrorBag) {
+                $ErrorBag.Add([PSCustomObject]@{
+                    Event    = 'BatchError'
+                    Index    = $h.Index
+                    Error    = $_.Exception.Message
+                    Metadata = $h.Metadata
+                })
+            }
+        }
+        finally {
+            $h.PowerShell.Dispose()
+        }
+    }
+
+    , $results
+}
+
 function Invoke-RunspacePoolWork {
     <#
     .SYNOPSIS
@@ -500,14 +638,11 @@ function Invoke-RunspacePoolWork {
         and capture per-input failures into ErrorBag without throwing.
 
     .DESCRIPTION
-        Generic dispatcher. Submits each input to a fresh PowerShell pipeline
-        bound to the pool, collects handles, then drains them via EndInvoke.
-        Per-input exceptions (raised by the work unit) are caught and
-        recorded as BatchError entries on -ErrorBag; the dispatcher does not
-        re-throw, so a single bad batch never aborts the run (plan §14).
-
-        For Phase 3 the work unit is Invoke-AceParsingWorkUnit and inputs
-        are batches of List[PSObject].
+        Thin wrapper that submits every -Input via Submit-RunspaceWorkItem
+        and then drains the resulting handles via Receive-RunspaceHandle.
+        Use this when the full input set is available up-front; for the
+        Phase 2/3 interleaved pipeline pattern, call Submit/Receive
+        separately (the entry script does this).
 
     .PARAMETER Pool
         Opened RunspacePool from New-RunspacePool.
@@ -521,7 +656,7 @@ function Invoke-RunspacePoolWork {
         unit.
 
     .PARAMETER ErrorBag
-        Optional sink for BatchError records: Event, Error, Inputs, Index.
+        Optional sink for BatchError records: Event, Index, Error, Metadata.
         The List[PSObject] is the script-scoped $ErrorBag in production.
     #>
     [CmdletBinding()]
@@ -546,39 +681,15 @@ function Invoke-RunspacePoolWork {
     $handles = [List[PSObject]]::new()
     $index   = 0
     foreach ($item in $Inputs) {
-        $ps = [powershell]::Create()
-        $ps.RunspacePool = $Pool
-        [void] $ps.AddScript($WorkUnit).AddArgument($item)
-        $handles.Add([PSCustomObject]@{
-            PowerShell = $ps
-            Handle     = $ps.BeginInvoke()
-            Index      = $index
-            Item       = $item
-        })
+        $submitParams = @{
+            Pool     = $Pool
+            WorkUnit = $WorkUnit
+            Item     = $item
+            Index    = $index
+        }
+        $handles.Add((Submit-RunspaceWorkItem @submitParams))
         $index++
     }
 
-    $results = [List[PSObject]]::new()
-    foreach ($h in $handles) {
-        try {
-            $output = $h.PowerShell.EndInvoke($h.Handle)
-            foreach ($o in $output) {
-                $results.Add($o)
-            }
-        }
-        catch {
-            if ($null -ne $ErrorBag) {
-                $ErrorBag.Add([PSCustomObject]@{
-                    Event = 'BatchError'
-                    Index = $h.Index
-                    Error = $_.Exception.Message
-                })
-            }
-        }
-        finally {
-            $h.PowerShell.Dispose()
-        }
-    }
-
-    , $results
+    Receive-RunspaceHandle -Handles $handles -ErrorBag $ErrorBag
 }

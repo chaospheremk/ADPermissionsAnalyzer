@@ -261,6 +261,31 @@ Describe 'Resolve-TrusteeSid' {
         $script:Cache.Count       | Should -Be 1
     }
 
+    It 'classifies CrossDomain when Translate succeeds but the SID is not in the local directory' {
+        # Trusted-forest / external principals: the local LSA can resolve the
+        # name via SID-history or forest trust, but a SID search of the local
+        # directory returns nothing. Distinct from WellKnown and Orphaned.
+        Mock Resolve-NTAccount { 'OTHERFOREST\external-user' }
+        Mock Invoke-PagedLdapSearch {
+            # Empty result set — the SID belongs to a foreign domain.
+            , [List[hashtable]]::new()
+        }
+
+        $resolveParams = @{
+            Sid                 = $script:TestUserSid
+            Cache               = $script:Cache
+            WellKnownSidMap     = $script:WellKnownSidMap
+            Connection          = $script:Conn
+            DomainNamingContext = $script:DomainNc
+        }
+        $result = Resolve-TrusteeSid @resolveParams
+
+        $result.PrincipalType     | Should -Be 'CrossDomain'
+        $result.Name              | Should -Be 'OTHERFOREST\external-user'
+        $result.DistinguishedName | Should -BeNullOrEmpty
+        $script:Cache.Count       | Should -Be 1
+    }
+
     It 'distinguishes sMSA from gMSA via objectClass priority' {
         Mock Resolve-NTAccount { 'LAB\svc-old$' }
         Mock Invoke-PagedLdapSearch {
@@ -402,12 +427,46 @@ Describe 'Expand-GroupTransitive' {
         $members = Expand-GroupTransitive @expandParams
 
         $members.Count | Should -Be 3
-        $sids = $members | ForEach-Object { $_.Sid } | Sort-Object
+        $sids = @($members).ForEach({ $_.Sid }) | Sort-Object
         $sids | Should -Be (@($script:TestNestedSid, $user1Sid, $user2Sid) | Sort-Object)
 
         # Cache populated under the group's SID for short-circuit on re-call.
         $script:GroupCache.Count | Should -Be 1
         $script:GroupCache.ContainsKey($script:TestGroupSid) | Should -BeTrue
+    }
+
+    It 'caps result size at -MaxMembers and emits a truncation warning' {
+        Mock Invoke-PagedLdapSearch -ParameterFilter {
+            $Filter -like '*1.2.840.113556.1.4.1941*'
+        } -MockWith {
+            $entries = [List[hashtable]]::new()
+            foreach ($i in 1..5) {
+                $sid = "S-1-5-21-100-200-300-300$i"
+                $entries.Add( (New-LdapEntry `
+                    -DistinguishedName "CN=u$i,OU=Users,$script:DomainNc" `
+                    -Attributes @{
+                        objectClass    = @('top', 'person', 'user')
+                        sAMAccountName = @("u$i")
+                        objectSid      = (New-OctetFixture -Bytes (New-SidBytes $sid))
+                    }) )
+            }
+            , $entries
+        }
+
+        $expandParams = @{
+            GroupSid               = $script:TestGroupSid
+            GroupDistinguishedName = "CN=Tier0-Admins,OU=Groups,$script:DomainNc"
+            Cache                  = $script:GroupCache
+            Connection             = $script:Conn
+            DomainNamingContext    = $script:DomainNc
+            MaxMembers             = 2
+        }
+        $warnings = $null
+        $members  = Expand-GroupTransitive @expandParams -WarningVariable warnings -WarningAction SilentlyContinue
+
+        $members.Count   | Should -Be 2
+        $warnings.Count  | Should -BeGreaterThan 0
+        $warnings[0].Message | Should -Match 'truncated at -MaxMembers=2'
     }
 
     It 'returns the cached list and makes no LDAP call on a repeat lookup' {

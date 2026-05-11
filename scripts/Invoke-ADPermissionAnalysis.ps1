@@ -1,5 +1,6 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
+using namespace System.DirectoryServices.Protocols
 using namespace System.IO
 using namespace System.Text
 
@@ -52,8 +53,9 @@ using namespace System.Text
     Number of objects per runspace work unit during phase 3 ACE parsing. Default: 250.
 
 .PARAMETER ThreadCount
-    Number of runspaces in the pool. Default: [Environment]::ProcessorCount. Values
-    above 16 typically waste effort because LDAP becomes the bottleneck.
+    Number of runspaces in the pool. Default: [Environment]::ProcessorCount. Accepted
+    range 1-32; in practice LDAP becomes the bottleneck around 8-16 threads, so values
+    above ~16 typically yield diminishing returns.
 
 .PARAMETER PageSize
     LDAP paged-search page size. Default: 1000 (the AD server-side cap).
@@ -248,7 +250,7 @@ $pivotPath  = Join-Path -Path $resolvedOutput -ChildPath $PivotFileName
 # --- Script-scoped state ----------------------------------------------------
 
 $script:LogWriter = [StreamWriter]::new($logPath, $false, [Encoding]::UTF8)
-$script:LogWriter.AutoFlush = $true
+$script:LogWriter.AutoFlush = $false
 $script:ErrorBag  = [List[PSObject]]::new()
 
 $exitCode = 0
@@ -309,8 +311,10 @@ try {
 
     $configurationContext = ($namingContexts.Where({ $_.Type -eq 'Configuration' }))[0]
     $schemaContext        = ($namingContexts.Where({ $_.Type -eq 'Schema' }))[0]
+    $domainContext        = ($namingContexts.Where({ $_.Type -eq 'Domain' }))[0]
     if (-not $configurationContext) { throw 'Configuration NC not present in RootDSE.' }
     if (-not $schemaContext)        { throw 'Schema NC not present in RootDSE.' }
+    if (-not $domainContext)        { throw 'Domain NC not present in RootDSE.' }
 
     $extRightsParams = @{
         Connection                 = $script:LdapConnection
@@ -351,7 +355,7 @@ try {
     }
     Write-LogEvent @mapBuiltParams
 
-    $phase1ElapsedMs = [int] ([DateTime]::UtcNow - $phase1Start).TotalMilliseconds
+    $phase1ElapsedMs = [long] ([DateTime]::UtcNow - $phase1Start).TotalMilliseconds
     $phase1EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase1'
@@ -360,6 +364,44 @@ try {
         Data      = @{ elapsedMs = $phase1ElapsedMs }
     }
     Write-LogEvent @phase1EndParams
+
+    # --- Pre-flight: verify the running account can read nTSecurityDescriptor
+    #     on the domain NC root. Without this check, an account that lacks
+    #     DACL-read rights produces a zero-row CSV with exit code 0 — a silent
+    #     false success that misleads the operator. Fail loudly instead.
+    $preflightSdControl = [SecurityDescriptorFlagControl]::new(
+        [SecurityMasks]::Owner -bor [SecurityMasks]::Dacl)
+    $preflightSearchParams = @{
+        Connection         = $script:LdapConnection
+        SearchBase         = $domainContext.DistinguishedName
+        Filter             = '(objectClass=*)'
+        Attributes         = @('nTSecurityDescriptor')
+        BinaryAttributes   = @('nTSecurityDescriptor')
+        AdditionalControls = , $preflightSdControl
+        Scope              = [SearchScope]::Base
+    }
+    $preflightSdBytes = $null
+    foreach ($entry in (Read-LdapEntry @preflightSearchParams)) {
+        $sdValues = $entry.Attributes['nTSecurityDescriptor']
+        if ($sdValues -and $sdValues.Count -gt 0) {
+            $preflightSdBytes = $sdValues[0]
+        }
+        break
+    }
+    if (-not $preflightSdBytes -or $preflightSdBytes.Length -eq 0) {
+        $preflightFailParams = @{
+            Level     = 'ERROR'
+            Phase     = 'PreFlight'
+            EventName = 'PreFlightFailed'
+            Message   = "Cannot read nTSecurityDescriptor on $($domainContext.DistinguishedName) — account lacks DACL-read rights or attribute is empty. Aborting before Phase 2."
+            Data      = @{
+                domainNamingContext = $domainContext.DistinguishedName
+                reason              = 'NullOrEmptySecurityDescriptor'
+            }
+        }
+        Write-LogEvent @preflightFailParams
+        throw "Pre-flight failed: cannot read nTSecurityDescriptor on $($domainContext.DistinguishedName)."
+    }
 
     # --- Phase 2: Object enumeration ---------------------------------------
     $phase2Start = [DateTime]::UtcNow
@@ -372,6 +414,22 @@ try {
     Write-LogEvent @phase2StartParams
 
     $selectedNcs = $namingContexts.Where({ $_.Type -in $IncludeNamingContexts })
+    if ($selectedNcs.Count -eq 0) {
+        $discoveredTypes = [string[]] ($namingContexts.ForEach({ $_.Type }))
+        $ncFilterFailParams = @{
+            Level     = 'ERROR'
+            Phase     = 'PreFlight'
+            EventName = 'PreFlightFailed'
+            Message   = "-IncludeNamingContexts $($IncludeNamingContexts -join ',') matched no discovered naming contexts. Discovered types: $($discoveredTypes -join ',')."
+            Data      = @{
+                requestedTypes  = $IncludeNamingContexts
+                discoveredTypes = $discoveredTypes
+                reason          = 'NoNamingContextsMatched'
+            }
+        }
+        Write-LogEvent @ncFilterFailParams
+        throw "Pre-flight failed: -IncludeNamingContexts matched no naming contexts (requested: $($IncludeNamingContexts -join ','); discovered: $($discoveredTypes -join ','))."
+    }
     $progressIntervalObjects = 5000
     $totalObjects = 0
 
@@ -407,8 +465,7 @@ try {
         Invoke-AceParsingWorkUnit @params
     }
 
-    $handles    = [System.Collections.Generic.List[PSObject]]::new()
-    $aceRecords = [System.Collections.Generic.List[PSObject]]::new()
+    $handles = [System.Collections.Generic.List[PSObject]]::new()
 
     foreach ($nc in $selectedNcs) {
         $ncStart           = [DateTime]::UtcNow
@@ -427,15 +484,17 @@ try {
             $totalObjects      += $batch.Count
             $sinceLastProgress += $batch.Count
 
-            $ps = [powershell]::Create()
-            $ps.RunspacePool = $script:Phase3Pool
-            [void] $ps.AddScript($workUnit).AddArgument($batch)
-            $handles.Add([PSCustomObject]@{
-                PowerShell    = $ps
-                Handle        = $ps.BeginInvoke()
-                NamingContext = $nc.DistinguishedName
-                BatchSize     = $batch.Count
-            })
+            $submitParams = @{
+                Pool     = $script:Phase3Pool
+                WorkUnit = $workUnit
+                Item     = $batch
+                Index    = $handles.Count
+                Metadata = @{
+                    NamingContext = $nc.DistinguishedName
+                    BatchSize     = $batch.Count
+                }
+            }
+            $handles.Add((Submit-RunspaceWorkItem @submitParams))
 
             if ($sinceLastProgress -ge $progressIntervalObjects) {
                 $progressParams = @{
@@ -462,7 +521,7 @@ try {
             }
         }
 
-        $ncElapsedMs = [int] ([DateTime]::UtcNow - $ncStart).TotalMilliseconds
+        $ncElapsedMs = [long] ([DateTime]::UtcNow - $ncStart).TotalMilliseconds
         $ncCompleteParams = @{
             Level     = 'INFO'
             Phase     = 'Phase2'
@@ -490,7 +549,7 @@ try {
 
     Write-Progress -Activity 'AD Permissions Analyzer - Phase 2' -Completed
 
-    $phase2ElapsedMs = [int] ([DateTime]::UtcNow - $phase2Start).TotalMilliseconds
+    $phase2ElapsedMs = [long] ([DateTime]::UtcNow - $phase2Start).TotalMilliseconds
     $phase2EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase2'
@@ -505,41 +564,27 @@ try {
     Write-LogEvent @phase2EndParams
 
     # --- Phase 3 drain: collect parsed ACE records from queued runspaces ---
-    foreach ($h in $handles) {
-        try {
-            $batchResult = $h.PowerShell.EndInvoke($h.Handle)
-            foreach ($r in $batchResult) {
-                $aceRecords.Add($r)
+    # Receive-RunspaceHandle captures terminating + non-terminating errors per
+    # handle into $script:ErrorBag; we fan those out to the JSONL log here.
+    $preDrainErrorCount = $script:ErrorBag.Count
+    $aceRecords = Receive-RunspaceHandle -Handles $handles -ErrorBag $script:ErrorBag
+    for ($i = $preDrainErrorCount; $i -lt $script:ErrorBag.Count; $i++) {
+        $err = $script:ErrorBag[$i]
+        $errMeta = $err.Metadata
+        $batchErrParams = @{
+            Level     = 'WARN'
+            Phase     = 'Phase3'
+            EventName = 'BatchError'
+            Message   = "Phase 3 batch failed: $($err.Error)"
+            Data      = @{
+                namingContext = if ($errMeta) { $errMeta.NamingContext } else { $null }
+                batchSize     = if ($errMeta) { $errMeta.BatchSize }     else { $null }
             }
         }
-        catch {
-            $errorRecord = [PSCustomObject]@{
-                Event         = 'BatchError'
-                Phase         = 'Phase3'
-                NamingContext = $h.NamingContext
-                BatchSize     = $h.BatchSize
-                Error         = $_.Exception.Message
-            }
-            $script:ErrorBag.Add($errorRecord)
-
-            $batchErrParams = @{
-                Level     = 'WARN'
-                Phase     = 'Phase3'
-                EventName = 'BatchError'
-                Message   = "Phase 3 batch failed: $($_.Exception.Message)"
-                Data      = @{
-                    namingContext = $h.NamingContext
-                    batchSize     = $h.BatchSize
-                }
-            }
-            Write-LogEvent @batchErrParams
-        }
-        finally {
-            $h.PowerShell.Dispose()
-        }
+        Write-LogEvent @batchErrParams
     }
 
-    $phase3ElapsedMs = [int] ([DateTime]::UtcNow - $phase3Start).TotalMilliseconds
+    $phase3ElapsedMs = [long] ([DateTime]::UtcNow - $phase3Start).TotalMilliseconds
     $phase3EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase3'
@@ -563,11 +608,6 @@ try {
         Message   = 'Phase 4: trustee resolution + group expansion.'
     }
     Write-LogEvent @phase4StartParams
-
-    $domainContext = ($namingContexts.Where({ $_.Type -eq 'Domain' }))[0]
-    if (-not $domainContext) {
-        throw 'Domain NC not present in RootDSE — Phase 4 cannot resolve trustees.'
-    }
 
     $domainSid = Get-DomainSid -Connection $script:LdapConnection `
                                -DomainNamingContext $domainContext.DistinguishedName
@@ -641,7 +681,7 @@ try {
     }
     else { 0.0 }
 
-    $phase4ElapsedMs = [int] ([DateTime]::UtcNow - $phase4Start).TotalMilliseconds
+    $phase4ElapsedMs = [long] ([DateTime]::UtcNow - $phase4Start).TotalMilliseconds
     $phase4EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase4'
@@ -654,7 +694,6 @@ try {
             expandedGroups         = $expansionMisses
             expansionLookups       = $expansionLookups
             expansionCacheHitRatio = $hitRatio
-            domainSid              = $domainSid
             skipTransitiveExpansion = [bool] $SkipTransitiveExpansion
             elapsedMs              = $phase4ElapsedMs
         }
@@ -691,7 +730,7 @@ try {
         $anomalyParams = @{
             Level     = 'WARN'
             Phase     = 'Phase5'
-            EventName = 'BatchError'
+            EventName = 'InheritedAceOnProtectedDacl'
             Message   = "InheritedAceOnProtectedDacl on $($anomaly.ObjectDN)."
             Data      = @{
                 reason     = 'InheritedAceOnProtectedDacl'
@@ -705,7 +744,7 @@ try {
         $script:ErrorBag.Add($anomaly)
     }
 
-    $phase5ElapsedMs = [int] ([DateTime]::UtcNow - $phase5Start).TotalMilliseconds
+    $phase5ElapsedMs = [long] ([DateTime]::UtcNow - $phase5Start).TotalMilliseconds
     $phase5EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase5'
@@ -771,7 +810,7 @@ try {
 
     Write-Progress -Activity 'AD Permissions Analyzer - Phase 6' -Completed
 
-    $phase6ElapsedMs = [int] ([DateTime]::UtcNow - $phase6Start).TotalMilliseconds
+    $phase6ElapsedMs = [long] ([DateTime]::UtcNow - $phase6Start).TotalMilliseconds
     $phase6EndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase6'
@@ -803,7 +842,7 @@ try {
     }
     $pivotRowCount = Write-PivotCsv @pivotParams
 
-    $pivotElapsedMs = [int] ([DateTime]::UtcNow - $pivotStart).TotalMilliseconds
+    $pivotElapsedMs = [long] ([DateTime]::UtcNow - $pivotStart).TotalMilliseconds
     $pivotEndParams = @{
         Level     = 'INFO'
         Phase     = 'Phase6'

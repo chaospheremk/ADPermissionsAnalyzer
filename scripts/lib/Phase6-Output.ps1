@@ -28,9 +28,10 @@ using namespace System.Text
     distinct object even when an object has hundreds of ACEs.
 #>
 
-# Detail CSV column order — plan §11. Single source of truth used by both
-# Write-CsvHeader and ConvertTo-DetailRow so the header and per-row writes
-# stay in lockstep without a second list to maintain.
+# Detail CSV column order — plan §11. Single source of truth used by
+# Write-CsvHeader so the header and Write-DetailCsv's inlined per-row
+# write stay in lockstep. The inlined row write must keep this column
+# order exactly; tests assert the shape end-to-end via Import-Csv.
 $script:Phase6DetailColumns = @(
     'ObjectDN'
     'ObjectClass'
@@ -72,8 +73,8 @@ function New-CsvFieldEscaper {
     .DESCRIPTION
         Quotes the field iff it contains a comma, double-quote, CR, or LF;
         embedded double-quotes are doubled. Returns '' for $null / empty
-        (no quoting). Pure helper used by ConvertTo-DetailRow once per
-        column per row — keep allocation-light.
+        (no quoting). Pure helper used by Write-DetailCsv's inlined row
+        builder once per column per row — keep allocation-light.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
@@ -117,127 +118,6 @@ function Write-CsvHeader {
     )
 
     $Writer.WriteLine([string]::Join(',', $script:Phase6DetailColumns))
-}
-
-function ConvertTo-DetailRow {
-    <#
-    .SYNOPSIS
-        Build one detail-CSV row as an ordered [string[]] of escaped fields.
-
-    .DESCRIPTION
-        Pure transform: takes one ACE record (post-Phase 5, with
-        InheritanceSourceDN / InheritanceSourceNote populated), the
-        already-resolved AceTrustee + EffectiveTrustee PSObjects (Phase 4
-        cache shape: Sid, Name, PrincipalType, DistinguishedName), the
-        IsThroughGroup flag and GroupExpansionPath string from
-        Get-EffectiveTrusteeRecord, the NamingContext label, and the run's
-        UTC ISO-8601 CollectedAt timestamp. Emits a [string[]] of escaped
-        fields in plan-§11 column order — caller joins with ',' and
-        WriteLine's via a StreamWriter.
-
-        Synthetic.Owner rows pass through with AceIndex = -1 and
-        RightsDecoded = 'OwnerImplicit' unchanged. PARSE_ERROR rows emit
-        the captured exception message in ObjectTypeName (the placeholder
-        contract from Phase 3).
-
-    .PARAMETER Ace
-        Phase 3 ACE record after Phase 5 mutation.
-
-    .PARAMETER AceTrustee
-        Resolved trustee PSObject for the ACE's TrusteeSid (Phase 4 cache).
-
-    .PARAMETER EffectiveTrustee
-        Resolved trustee PSObject for the effective trustee — equals
-        $AceTrustee for direct/terminal/non-group ACEs, or one of the
-        group's transitive members for expanded rows.
-
-    .PARAMETER IsThroughGroup
-        True iff the effective trustee was reached via group expansion.
-
-    .PARAMETER GroupExpansionPath
-        Group chain (currently the ACE-trustee group's name; in-chain
-        matching rule loses intermediate hops). Empty for direct rows.
-
-    .PARAMETER NamingContext
-        Pre-resolved NC label — Domain / Configuration / Schema /
-        DNS:<partition-DN>.
-
-    .PARAMETER CollectedAt
-        UTC ISO-8601 timestamp string for the run.
-    #>
-    [CmdletBinding()]
-    [OutputType([string[]])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [PSObject] $Ace,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [PSObject] $AceTrustee,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [PSObject] $EffectiveTrustee,
-
-        [Parameter(Mandatory)]
-        [bool] $IsThroughGroup,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string] $GroupExpansionPath,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string] $NamingContext,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string] $CollectedAt
-    )
-
-    $objectTypeGuid          = if ($Ace.ObjectTypeGuid)          { [string] $Ace.ObjectTypeGuid }          else { '' }
-    $inheritedObjectTypeGuid = if ($Ace.InheritedObjectTypeGuid) { [string] $Ace.InheritedObjectTypeGuid } else { '' }
-    $objectGuid              = if ($Ace.ObjectGUID)              { [string] $Ace.ObjectGUID }              else { '' }
-
-    $values = @(
-        [string] $Ace.ObjectDN
-        [string] $Ace.ObjectClass
-        $objectGuid
-        $NamingContext
-        [string] $AceTrustee.Sid
-        [string] $AceTrustee.Name
-        [string] $AceTrustee.PrincipalType
-        [string] $EffectiveTrustee.Sid
-        [string] $EffectiveTrustee.Name
-        [string] $EffectiveTrustee.PrincipalType
-        [string] $EffectiveTrustee.DistinguishedName
-        ([string] $IsThroughGroup)
-        $GroupExpansionPath
-        [string] $Ace.AceType
-        ([string] $Ace.AceIndex)
-        [string] $Ace.AccessControlType
-        [string] $Ace.RightsDecoded
-        ([string] $Ace.AccessMask)
-        $objectTypeGuid
-        [string] $Ace.ObjectTypeName
-        [string] $Ace.ObjectTypeKind
-        $inheritedObjectTypeGuid
-        [string] $Ace.InheritedObjectTypeName
-        ([string] $Ace.IsInherited)
-        ([string] $Ace.IsDaclProtected)
-        [string] $Ace.InheritanceSourceDN
-        [string] $Ace.InheritanceSourceNote
-        [string] $Ace.InheritanceFlags
-        ([string] $Ace.AceFlagsRaw)
-        $CollectedAt
-    )
-
-    $escaped = [string[]]::new($values.Length)
-    for ($i = 0; $i -lt $values.Length; $i++) {
-        $escaped[$i] = New-CsvFieldEscaper -Value $values[$i]
-    }
-    , $escaped
 }
 
 function Get-EffectiveTrusteeRecord {
@@ -611,6 +491,13 @@ function Write-DetailCsv {
     try {
         Write-CsvHeader -Writer $writer
 
+        # Row builder reuses one [string[]] per iteration. CollectedAt is
+        # constant for the run, so escape it once. Per-ACE invariant fields
+        # are escaped once per ACE and reused across all (effective-trustee)
+        # tuples — group expansion can fan one ACE into many rows.
+        $row = [string[]]::new($script:Phase6DetailColumns.Length)
+        $escCollectedAt = New-CsvFieldEscaper -Value $CollectedAt
+
         foreach ($ace in $AceRecords) {
             $ncLabelParams = @{
                 ObjectDN             = [string] $ace.ObjectDN
@@ -626,22 +513,70 @@ function Write-DetailCsv {
             }
             $tuples = Get-EffectiveTrusteeRecord @tupleParams
 
+            $aceObjectGuidStr  = if ($ace.ObjectGUID)              { [string] $ace.ObjectGUID }              else { '' }
+            $aceObjTypeGuidStr = if ($ace.ObjectTypeGuid)          { [string] $ace.ObjectTypeGuid }          else { '' }
+            $aceInhObjGuidStr  = if ($ace.InheritedObjectTypeGuid) { [string] $ace.InheritedObjectTypeGuid } else { '' }
+
+            $escObjectDN              = New-CsvFieldEscaper -Value ([string] $ace.ObjectDN)
+            $escObjectClass           = New-CsvFieldEscaper -Value ([string] $ace.ObjectClass)
+            $escObjectGuid            = New-CsvFieldEscaper -Value $aceObjectGuidStr
+            $escNcLabel               = New-CsvFieldEscaper -Value $ncLabel
+            $escAceType               = New-CsvFieldEscaper -Value ([string] $ace.AceType)
+            $escAceIndex              = New-CsvFieldEscaper -Value ([string] $ace.AceIndex)
+            $escAccessControlType     = New-CsvFieldEscaper -Value ([string] $ace.AccessControlType)
+            $escRightsDecoded         = New-CsvFieldEscaper -Value ([string] $ace.RightsDecoded)
+            $escAccessMask            = New-CsvFieldEscaper -Value ([string] $ace.AccessMask)
+            $escObjectTypeGuid        = New-CsvFieldEscaper -Value $aceObjTypeGuidStr
+            $escObjectTypeName        = New-CsvFieldEscaper -Value ([string] $ace.ObjectTypeName)
+            $escObjectTypeKind        = New-CsvFieldEscaper -Value ([string] $ace.ObjectTypeKind)
+            $escInheritedObjTypeGuid  = New-CsvFieldEscaper -Value $aceInhObjGuidStr
+            $escInheritedObjTypeName  = New-CsvFieldEscaper -Value ([string] $ace.InheritedObjectTypeName)
+            $escIsInherited           = New-CsvFieldEscaper -Value ([string] $ace.IsInherited)
+            $escIsDaclProtected       = New-CsvFieldEscaper -Value ([string] $ace.IsDaclProtected)
+            $escInheritanceSourceDN   = New-CsvFieldEscaper -Value ([string] $ace.InheritanceSourceDN)
+            $escInheritanceSourceNote = New-CsvFieldEscaper -Value ([string] $ace.InheritanceSourceNote)
+            $escInheritanceFlags      = New-CsvFieldEscaper -Value ([string] $ace.InheritanceFlags)
+            $escAceFlagsRaw           = New-CsvFieldEscaper -Value ([string] $ace.AceFlagsRaw)
+
             foreach ($tuple in $tuples) {
-                $rowParams = @{
-                    Ace                = $ace
-                    AceTrustee         = $tuple.AceTrustee
-                    EffectiveTrustee   = $tuple.EffectiveTrustee
-                    IsThroughGroup     = $tuple.IsThroughGroup
-                    GroupExpansionPath = $tuple.GroupExpansionPath
-                    NamingContext      = $ncLabel
-                    CollectedAt        = $CollectedAt
-                }
-                $row = ConvertTo-DetailRow @rowParams
+                $aceTrustee       = $tuple.AceTrustee
+                $effectiveTrustee = $tuple.EffectiveTrustee
+
+                $row[0]  = $escObjectDN
+                $row[1]  = $escObjectClass
+                $row[2]  = $escObjectGuid
+                $row[3]  = $escNcLabel
+                $row[4]  = New-CsvFieldEscaper -Value ([string] $aceTrustee.Sid)
+                $row[5]  = New-CsvFieldEscaper -Value ([string] $aceTrustee.Name)
+                $row[6]  = New-CsvFieldEscaper -Value ([string] $aceTrustee.PrincipalType)
+                $row[7]  = New-CsvFieldEscaper -Value ([string] $effectiveTrustee.Sid)
+                $row[8]  = New-CsvFieldEscaper -Value ([string] $effectiveTrustee.Name)
+                $row[9]  = New-CsvFieldEscaper -Value ([string] $effectiveTrustee.PrincipalType)
+                $row[10] = New-CsvFieldEscaper -Value ([string] $effectiveTrustee.DistinguishedName)
+                $row[11] = New-CsvFieldEscaper -Value ([string] $tuple.IsThroughGroup)
+                $row[12] = New-CsvFieldEscaper -Value ([string] $tuple.GroupExpansionPath)
+                $row[13] = $escAceType
+                $row[14] = $escAceIndex
+                $row[15] = $escAccessControlType
+                $row[16] = $escRightsDecoded
+                $row[17] = $escAccessMask
+                $row[18] = $escObjectTypeGuid
+                $row[19] = $escObjectTypeName
+                $row[20] = $escObjectTypeKind
+                $row[21] = $escInheritedObjTypeGuid
+                $row[22] = $escInheritedObjTypeName
+                $row[23] = $escIsInherited
+                $row[24] = $escIsDaclProtected
+                $row[25] = $escInheritanceSourceDN
+                $row[26] = $escInheritanceSourceNote
+                $row[27] = $escInheritanceFlags
+                $row[28] = $escAceFlagsRaw
+                $row[29] = $escCollectedAt
                 $writer.WriteLine([string]::Join(',', $row))
 
                 $statParams = @{
                     Stats            = $PivotStats
-                    EffectiveTrustee = $tuple.EffectiveTrustee
+                    EffectiveTrustee = $effectiveTrustee
                     Ace              = $ace
                     IsThroughGroup   = $tuple.IsThroughGroup
                     NamingContext    = $ncLabel
@@ -652,7 +587,7 @@ function Write-DetailCsv {
                 if ($ProgressCallback -and ($rowsWritten % $ProgressInterval -eq 0)) {
                     $progressData = @{
                         rowsWritten = $rowsWritten
-                        elapsedMs   = [int] ([DateTime]::UtcNow - $start).TotalMilliseconds
+                        elapsedMs   = [long] ([DateTime]::UtcNow - $start).TotalMilliseconds
                     }
                     & $ProgressCallback $progressData
                 }
@@ -908,7 +843,10 @@ function Write-PivotCsv {
         [string] $CollectedAt
     )
 
-    $writer = [StreamWriter]::new($PivotPath, $false, [UTF8Encoding]::new($false))
+    # ADR-018 (amended): pivot CSV ships with a UTF-8 BOM so Excel on Windows
+    # renders non-ASCII DN/trustee values correctly without a manual import.
+    # The detail CSV remains BOM-less for batch consumers (pandas/Power BI/SIEM).
+    $writer = [StreamWriter]::new($PivotPath, $false, [UTF8Encoding]::new($true))
     $writer.AutoFlush = $false
 
     $rowsWritten = 0

@@ -371,7 +371,9 @@ function Resolve-TrusteeSid {
         in-domain LDAP lookup by objectSid to refine PrincipalType from
         objectClass (User / Group / Computer / sMSA / gMSA). Builtin and
         NT AUTHORITY translations short-circuit to PrincipalType =
-        'WellKnown' without an LDAP roundtrip.
+        'WellKnown' without an LDAP roundtrip. When Translate succeeds
+        but the SID is not in the local directory, PrincipalType is
+        'CrossDomain' — typically a trusted-forest or external principal.
 
         Always populates -Cache before emitting so subsequent calls hit
         path 1 and skip both LSA and LDAP traffic.
@@ -459,10 +461,11 @@ function Resolve-TrusteeSid {
                 $resolved.PrincipalType     = $domain.PrincipalType
             }
             else {
-                # Translate succeeded but the principal isn't in our domain —
-                # treat as well-known for visibility; an FSP/orphan would have
-                # failed Translate on most environments.
-                $resolved.PrincipalType = 'WellKnown'
+                # Translate succeeded but the principal isn't in this domain's
+                # directory — typically a trusted cross-forest/external user or
+                # group whose name the local LSA can resolve. Distinct from
+                # WellKnown (SYSTEM/Everyone) and Orphaned (no Translate).
+                $resolved.PrincipalType = 'CrossDomain'
             }
         }
     }
@@ -582,9 +585,13 @@ function Expand-GroupTransitive {
     }
     $entries = Invoke-PagedLdapSearch @searchParams
 
-    $members = [List[PSObject]]::new()
+    $members   = [List[PSObject]]::new()
+    $truncated = $false
     foreach ($entry in $entries) {
-        if ($members.Count -ge $MaxMembers) { break }
+        if ($members.Count -ge $MaxMembers) {
+            $truncated = $true
+            break
+        }
 
         $sidValues = $entry.Attributes['objectSid']
         $memberSid = $null
@@ -602,6 +609,10 @@ function Expand-GroupTransitive {
             PrincipalType     = $type
             DistinguishedName = $entry.DistinguishedName
         })
+    }
+
+    if ($truncated) {
+        Write-Warning ("Group {0} transitive expansion truncated at -MaxMembers={1}; the server returned more members. Increase -MaxMembers or scope the run if completeness matters." -f $GroupDistinguishedName, $MaxMembers)
     }
 
     $Cache[$GroupSid] = $members

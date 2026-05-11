@@ -155,7 +155,7 @@ function Read-LdapEntry {
         [System.StringComparer]::OrdinalIgnoreCase)
 
     while ($true) {
-        $response = [SearchResponse] $Connection.SendRequest($request)
+        $response = $Connection.SendRequest($request)
 
         foreach ($entry in $response.Entries) {
             $attrs = @{}
@@ -174,18 +174,42 @@ function Read-LdapEntry {
             }
         }
 
-        $pageResp = $null
-        foreach ($control in $response.Controls) {
-            if ($control -is [PageResultResponseControl]) {
-                $pageResp = $control
-                break
-            }
-        }
+        $pageResp = Get-PageResultControl -Response $response
         if ($null -eq $pageResp -or $pageResp.Cookie.Length -eq 0) {
             break
         }
         $pageControl.Cookie = $pageResp.Cookie
     }
+}
+
+function Get-PageResultControl {
+    <#
+    .SYNOPSIS
+        Extract the PageResultResponseControl from a SearchResponse, or $null
+        if none is present (terminal page).
+
+    .DESCRIPTION
+        Extracted from Read-LdapEntry so the paging-cookie continuation can
+        be unit-tested with a duck-typed fake response. Production behaviour
+        is unchanged: walks $Response.Controls, returns the first
+        [PageResultResponseControl], else $null. Pester tests override this
+        function via Mock to drive Read-LdapEntry through a synthetic
+        two-page sequence.
+    #>
+    [CmdletBinding()]
+    [OutputType([PageResultResponseControl])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        $Response
+    )
+
+    foreach ($control in $Response.Controls) {
+        if ($control -is [PageResultResponseControl]) {
+            return $control
+        }
+    }
+    $null
 }
 
 function Invoke-PagedLdapSearch {

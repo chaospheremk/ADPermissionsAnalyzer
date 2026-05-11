@@ -350,6 +350,93 @@ Describe 'New-PropertySetMembersMap' {
     }
 }
 
+Describe 'Read-LdapEntry paging continuation' {
+    BeforeAll {
+        # Real PageResultResponseControl is sealed with internal constructors,
+        # so the synthetic page-1 control is a duck-typed PSCustomObject. The
+        # production extraction (-is [PageResultResponseControl]) is delegated
+        # to Get-PageResultControl which we Mock per-It below.
+        function New-FakeAttribute {
+            param([Parameter(Mandatory)] [string] $Value)
+            $attr = [PSCustomObject]@{}
+            $closureValue = $Value
+            Add-Member -InputObject $attr -MemberType ScriptMethod -Name GetValues -Value {
+                param([type] $Type)
+                ,([string[]] @($closureValue))
+            }.GetNewClosure() -Force
+            $attr
+        }
+
+        function New-FakeEntry {
+            param([Parameter(Mandatory)] [string] $DN)
+            # Hashtable supports the $obj[$name] indexer; Add-Member layers an
+            # AttributeNames NoteProperty so $obj.AttributeNames returns the
+            # name list without colliding with the key set.
+            $attrs = @{ distinguishedName = (New-FakeAttribute -Value $DN) }
+            $attrs | Add-Member -MemberType NoteProperty -Name AttributeNames -Value @('distinguishedName')
+            [PSCustomObject]@{
+                DistinguishedName = $DN
+                Attributes        = $attrs
+            }
+        }
+
+        function New-FakeResponse {
+            param([Parameter(Mandatory)] [string[]] $Dns)
+            $entries = @()
+            foreach ($dn in $Dns) { $entries += (New-FakeEntry -DN $dn) }
+            [PSCustomObject]@{
+                Entries  = $entries
+                Controls = @()
+            }
+        }
+    }
+
+    It 'yields entries from both pages when the page-1 response has a non-empty cookie' {
+        # Fake connection whose SendRequest returns page 1 on the first call
+        # and page 2 on the second.
+        $script:PageCalls = 0
+        $script:PageResponses = @(
+            (New-FakeResponse -Dns @('CN=p1a,DC=lab', 'CN=p1b,DC=lab'))
+            (New-FakeResponse -Dns @('CN=p2a,DC=lab'))
+        )
+        $connection = [PSCustomObject]@{}
+        Add-Member -InputObject $connection -MemberType ScriptMethod -Name SendRequest -Value {
+            param($request)
+            $resp = $script:PageResponses[$script:PageCalls]
+            $script:PageCalls++
+            $resp
+        }
+
+        # Mock the page-control extractor: page 1 returns a non-empty cookie,
+        # page 2 returns $null (terminal). This drives Read-LdapEntry's
+        # while-loop through exactly one continuation.
+        $script:PageControlCalls = 0
+        Mock Get-PageResultControl {
+            $idx = $script:PageControlCalls
+            $script:PageControlCalls++
+            if ($idx -eq 0) {
+                [PSCustomObject]@{ Cookie = [byte[]] @(1, 2, 3) }
+            }
+            else {
+                $null
+            }
+        }
+
+        $params = @{
+            Connection = $connection
+            SearchBase = 'DC=lab,DC=local'
+            Filter     = '(objectClass=*)'
+            Attributes = @('distinguishedName')
+        }
+        $results = @(Read-LdapEntry @params)
+
+        $results.Count                | Should -Be 3
+        $script:PageCalls             | Should -Be 2
+        $results[0].DistinguishedName | Should -Be 'CN=p1a,DC=lab'
+        $results[2].DistinguishedName | Should -Be 'CN=p2a,DC=lab'
+    }
+}
+
 Describe 'Connect-AdLdap parameter resolution' {
     It 'throws when no -Server, no -Domain, and USERDNSDOMAIN is empty' {
         $original = $env:USERDNSDOMAIN
