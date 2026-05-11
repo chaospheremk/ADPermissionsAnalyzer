@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-11
+
+First release. Implements the six-phase orchestration from plan §18 steps 1–8 (steps 9–10 cancelled by ADR-025: no lab DC available). Ships without live-LDAP smoke validation; first operational run is exploratory. Correctness rests on 144 Pester unit cases across `scripts/lib/` (91.22% command coverage, gated at 86% per ADR-026).
+
 ### Added
 
 - `scripts/Invoke-ADPermissionAnalysis.ps1` — entry-point script skeleton (plan
@@ -276,5 +280,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   treated as the only command line and every subsequent line collapsed
   into the description, producing a malformed Example 2 block on
   `Invoke-ADPermissionAnalysis.md`.
-
-### Fixed
