@@ -111,41 +111,83 @@ Describe 'New-CsvFieldEscaper' {
     }
 }
 
-Describe 'ConvertTo-DetailRow' {
+Describe 'Write-DetailCsv row shape' {
     BeforeAll {
-        $script:AceTrustee = New-Trustee -Sid $script:UserSid -Name 'LAB\u1' -PrincipalType 'User' `
+        # Inlined into Write-DetailCsv (no standalone ConvertTo-DetailRow);
+        # tests assert the row shape end-to-end via Import-Csv on a temp file.
+        $script:AceTrusteeUser = New-Trustee -Sid $script:UserSid -Name 'LAB\u1' -PrincipalType 'User' `
             -DistinguishedName 'CN=u1,OU=Users,DC=lab,DC=local'
+
+        function New-DetailHarness {
+            [PSObject] $trustee = $script:AceTrusteeUser
+            $cache = [Dictionary[string, PSObject]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase)
+            $expansion = [Dictionary[string, List[PSObject]]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase)
+            $pivotStats = [Dictionary[string, PSObject]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase)
+            [PSCustomObject]@{
+                TrusteeCache        = $cache
+                GroupExpansionCache = $expansion
+                PivotStats          = $pivotStats
+            }
+        }
+
+        function Invoke-WriteDetailCsv {
+            param(
+                [Parameter(Mandatory)] [PSObject] $Ace,
+                [Parameter(Mandatory)] [PSObject] $Trustee
+            )
+            $harness = New-DetailHarness
+            $harness.TrusteeCache[$Trustee.Sid] = $Trustee
+
+            $records = [List[PSObject]]::new()
+            $records.Add($Ace)
+
+            $tempPath = [System.IO.Path]::GetTempFileName()
+            try {
+                $writeParams = @{
+                    DetailPath          = $tempPath
+                    AceRecords          = $records
+                    TrusteeCache        = $harness.TrusteeCache
+                    GroupExpansionCache = $harness.GroupExpansionCache
+                    NamingContexts      = $script:NamingContexts
+                    PivotStats          = $harness.PivotStats
+                    CollectedAt         = $script:CollectedAt
+                }
+                $rowsWritten = Write-DetailCsv @writeParams
+                $imported = Import-Csv -LiteralPath $tempPath
+                [PSCustomObject]@{
+                    Rows         = @($imported)
+                    RowsWritten  = $rowsWritten
+                    HeaderColumns = (Get-Content -LiteralPath $tempPath -TotalCount 1) -split ','
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     It 'emits one field per plan-§11 column in order' {
-        # Use a DN without commas so the per-column assertions don't have to
-        # account for RFC-4180 quoting on the ObjectDN field.
-        $ace = New-AceRecord -TrusteeSid $script:UserSid -ObjectDN 'DC=lab' -ObjectClass 'domain'
+        $ace = New-AceRecord -TrusteeSid $script:UserSid -ObjectDN $script:DomainNc -ObjectClass 'domain'
 
-        $rowParams = @{
-            Ace                = $ace
-            AceTrustee         = $script:AceTrustee
-            EffectiveTrustee   = $script:AceTrustee
-            IsThroughGroup     = $false
-            GroupExpansionPath = ''
-            NamingContext      = 'Domain'
-            CollectedAt        = $script:CollectedAt
-        }
-        $row = ConvertTo-DetailRow @rowParams
+        $result = Invoke-WriteDetailCsv -Ace $ace -Trustee $script:AceTrusteeUser
 
         # Tracks Phase6DetailColumns count (plan §11): 30 columns.
-        $row.Length    | Should -Be 30
-        $row[0]        | Should -Be 'DC=lab'
-        $row[3]        | Should -Be 'Domain'
-        $row[4]        | Should -Be $script:UserSid
-        # AceTrusteeName 'LAB\u1' has no escape triggers — passes through.
-        $row[5]        | Should -Be 'LAB\u1'
-        $row[6]        | Should -Be 'User'
-        $row[11]       | Should -Be 'False'
-        $row[13]       | Should -Be 'AccessAllowed'
-        $row[14]       | Should -Be '0'
-        $row[15]       | Should -Be 'Allow'
-        $row[-1]       | Should -Be $script:CollectedAt
+        $result.HeaderColumns.Count    | Should -Be 30
+        $result.Rows.Count             | Should -Be 1
+        $row = $result.Rows[0]
+        $row.ObjectDN                  | Should -Be $script:DomainNc
+        $row.NamingContext             | Should -Be 'Domain'
+        $row.AceTrusteeSid             | Should -Be $script:UserSid
+        $row.AceTrusteeName            | Should -Be 'LAB\u1'
+        $row.AceTrusteePrincipalType   | Should -Be 'User'
+        $row.IsThroughGroup            | Should -Be 'False'
+        $row.AceType                   | Should -Be 'AccessAllowed'
+        $row.AceIndex                  | Should -Be '0'
+        $row.AccessControlType         | Should -Be 'Allow'
+        $row.CollectedAt               | Should -Be $script:CollectedAt
     }
 
     It 'preserves Synthetic.Owner row shape (AceIndex=-1, OwnerImplicit, Allow)' {
@@ -158,21 +200,13 @@ Describe 'ConvertTo-DetailRow' {
             -AceIndex -1
         $ownerTrustee = New-Trustee -Sid $script:OwnerSid -Name 'LAB\owner' -PrincipalType 'User'
 
-        $rowParams = @{
-            Ace                = $ownerAce
-            AceTrustee         = $ownerTrustee
-            EffectiveTrustee   = $ownerTrustee
-            IsThroughGroup     = $false
-            GroupExpansionPath = ''
-            NamingContext      = 'Domain'
-            CollectedAt        = $script:CollectedAt
-        }
-        $row = ConvertTo-DetailRow @rowParams
+        $result = Invoke-WriteDetailCsv -Ace $ownerAce -Trustee $ownerTrustee
+        $row    = $result.Rows[0]
 
-        $row[13] | Should -Be 'Synthetic.Owner'
-        $row[14] | Should -Be '-1'
-        $row[15] | Should -Be 'Allow'
-        $row[16] | Should -Be 'OwnerImplicit'
+        $row.AceType            | Should -Be 'Synthetic.Owner'
+        $row.AceIndex           | Should -Be '-1'
+        $row.AccessControlType  | Should -Be 'Allow'
+        $row.RightsDecoded      | Should -Be 'OwnerImplicit'
     }
 
     It 'preserves PARSE_ERROR row exception message in ObjectTypeName' {
@@ -187,46 +221,29 @@ Describe 'ConvertTo-DetailRow' {
 
         $emptyTrustee = New-Trustee -Sid '' -Name '' -PrincipalType 'Unknown'
 
-        $rowParams = @{
-            Ace                = $errorAce
-            AceTrustee         = $emptyTrustee
-            EffectiveTrustee   = $emptyTrustee
-            IsThroughGroup     = $false
-            GroupExpansionPath = ''
-            NamingContext      = 'Domain'
-            CollectedAt        = $script:CollectedAt
-        }
-        $row = ConvertTo-DetailRow @rowParams
+        $result = Invoke-WriteDetailCsv -Ace $errorAce -Trustee $emptyTrustee
+        $row    = $result.Rows[0]
 
-        $row[13] | Should -Be 'PARSE_ERROR'
-        $row[14] | Should -Be '-2'
-        $row[19] | Should -Be 'Bad SD: nonsense'
+        $row.AceType        | Should -Be 'PARSE_ERROR'
+        $row.AceIndex       | Should -Be '-2'
+        $row.ObjectTypeName | Should -Be 'Bad SD: nonsense'
     }
 
     It 'populates InheritanceSourceDN for inherited rows' {
-        # Single-token DN avoids the embedded-comma quoting case exercised in
-        # the round-trip test below.
         $aceParams = @{
+            TrusteeSid            = $script:UserSid
             IsInherited           = $true
             InheritanceSourceDN   = 'DC=lab'
             InheritanceSourceNote = ''
         }
         $ace = New-AceRecord @aceParams
 
-        $rowParams = @{
-            Ace                = $ace
-            AceTrustee         = $script:AceTrustee
-            EffectiveTrustee   = $script:AceTrustee
-            IsThroughGroup     = $false
-            GroupExpansionPath = ''
-            NamingContext      = 'Domain'
-            CollectedAt        = $script:CollectedAt
-        }
-        $row = ConvertTo-DetailRow @rowParams
+        $result = Invoke-WriteDetailCsv -Ace $ace -Trustee $script:AceTrusteeUser
+        $row    = $result.Rows[0]
 
-        $row[23] | Should -Be 'True'
-        $row[25] | Should -Be 'DC=lab'
-        $row[26] | Should -Be ''
+        $row.IsInherited           | Should -Be 'True'
+        $row.InheritanceSourceDN   | Should -Be 'DC=lab'
+        $row.InheritanceSourceNote | Should -Be ''
     }
 }
 
@@ -443,6 +460,61 @@ Describe 'Write-DetailCsv' {
         $memberBucket.TotalAceCount       | Should -Be 1
         $memberBucket.IndirectAceCount    | Should -Be 1
         $memberBucket.DirectAceCount      | Should -Be 0
+    }
+}
+
+Describe 'Write-DetailCsv ProgressCallback' {
+    BeforeAll {
+        $script:ProgressWorkDir = Join-Path ([Path]::GetTempPath()) ("phase6-progress-{0}" -f ([guid]::NewGuid()))
+        New-Item -ItemType Directory -Path $script:ProgressWorkDir -Force | Out-Null
+    }
+
+    AfterAll {
+        if (Test-Path -LiteralPath $script:ProgressWorkDir) {
+            Remove-Item -LiteralPath $script:ProgressWorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fires the callback every -ProgressInterval rows with a counter that matches rowsWritten' {
+        $cache = [Dictionary[string, PSObject]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $cache[$script:UserSid] = New-Trustee -Sid $script:UserSid -Name 'LAB\u1' -PrincipalType 'User' `
+            -DistinguishedName "CN=u1,OU=Users,$script:DomainNc"
+        $expansion = [Dictionary[string, List[PSObject]]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+
+        $records = [List[PSObject]]::new()
+        foreach ($i in 1..10) {
+            $records.Add( (New-AceRecord -TrusteeSid $script:UserSid `
+                -ObjectDN "CN=u$i,OU=Users,$script:DomainNc" `
+                -AceIndex 0) )
+        }
+
+        $script:ProgressCalls = [List[hashtable]]::new()
+        $callback = { param([hashtable] $Data) $script:ProgressCalls.Add($Data) }
+
+        $detailPath = Join-Path $script:ProgressWorkDir 'detail-progress.csv'
+        $stats      = [Dictionary[string, PSObject]]::new()
+
+        $writeParams = @{
+            DetailPath          = $detailPath
+            AceRecords          = $records
+            TrusteeCache        = $cache
+            GroupExpansionCache = $expansion
+            NamingContexts      = $script:NamingContexts
+            PivotStats          = $stats
+            CollectedAt         = $script:CollectedAt
+            ProgressInterval    = 3
+            ProgressCallback    = $callback
+        }
+        $count = Write-DetailCsv @writeParams
+
+        $count                                   | Should -Be 10
+        # 3, 6, 9 → 3 fires for 10 rows at interval 3.
+        $script:ProgressCalls.Count              | Should -Be 3
+        $script:ProgressCalls[0]['rowsWritten']  | Should -Be 3
+        $script:ProgressCalls[1]['rowsWritten']  | Should -Be 6
+        $script:ProgressCalls[2]['rowsWritten']  | Should -Be 9
+        $script:ProgressCalls[0]['elapsedMs']    | Should -BeOfType ([long])
     }
 }
 

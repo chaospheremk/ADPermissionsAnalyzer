@@ -396,8 +396,37 @@ Describe 'Invoke-AceParsingWorkUnit' {
 
         $daclRows = $records.Where({ $_.AceType -ne 'Synthetic.Owner' })
         $daclRows.Count | Should -Be 2
-        $indices = $daclRows | ForEach-Object { $_.AceIndex } | Sort-Object
+        $indices = $daclRows.ForEach({ $_.AceIndex }) | Sort-Object
         $indices | Should -Be @(0, 1)
+    }
+
+    It 'emits PARSE_ERROR for an object with a null NTSecurityDescriptor' {
+        # Phase 2 sets NTSecurityDescriptor = $null for objects the running
+        # account cannot read DACLs on (and schema-only objects). Phase 3
+        # must isolate that via the same PARSE_ERROR placeholder path, not
+        # abort the batch.
+        $batch = [List[PSObject]]::new()
+        $batch.Add([PSCustomObject]@{
+            DistinguishedName     = 'CN=null-sd,DC=lab,DC=local'
+            StructuralObjectClass = 'user'
+            ObjectGUID            = [guid]::Empty
+            NTSecurityDescriptor  = $null
+        })
+
+        $params = @{
+            Batch             = $batch
+            ExtendedRightsMap = $script:ExtMap
+            SchemaGuidMap     = $script:SchemaMap
+        }
+        $records = Invoke-AceParsingWorkUnit @params
+
+        $records.Count                          | Should -Be 1
+        $records[0].AceType                     | Should -Be 'PARSE_ERROR'
+        $records[0].AceIndex                    | Should -Be -2
+        $records[0].ObjectDN                    | Should -Be 'CN=null-sd,DC=lab,DC=local'
+        # The catch path carries the underlying exception text into
+        # ObjectTypeName so an operator can diagnose from the CSV alone.
+        $records[0].ObjectTypeName              | Should -Not -BeNullOrEmpty
     }
 
     It 'isolates per-object parse failures with a PARSE_ERROR placeholder' {
@@ -453,7 +482,7 @@ Describe 'New-RunspacePool / Invoke-RunspacePoolWork' {
             $results = Invoke-RunspacePoolWork @params
 
             $results.Count | Should -Be 5
-            $values = ($results | ForEach-Object { $_.Doubled } | Sort-Object)
+            $values = @($results).ForEach({ $_.Doubled }) | Sort-Object
             $values | Should -Be @(2, 4, 6, 8, 10)
             $bag.Count | Should -Be 0
         }

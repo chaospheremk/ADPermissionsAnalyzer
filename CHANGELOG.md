@@ -6,7 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-05-11
+## [0.2.0] - 2026-05-11
+
+v0.1.0 hardening release. Driven by a fresh-context code review run between v0.1.0 and the first work-environment test. Closes out correctness, security, performance, ergonomics, and test-coverage findings before the first live-LDAP run. Coverage moves from 91.22% to 93.22% (gated at 86% per ADR-026).
+
+### Added
+
+- **Pre-flight checks** (ADR-027). Two guards inserted between Phase 1 and Phase 2 in `scripts/Invoke-ADPermissionAnalysis.ps1` (`PreFlightFailed` ERROR events with `reason = NullOrEmptySecurityDescriptor` / `NoNamingContextsMatched`):
+  - **`nTSecurityDescriptor` readability probe**: a single Base-scope read on the Domain NC root with `SecurityDescriptorFlagControl(Owner | Dacl)`. Aborts before Phase 2 if the running account cannot read DACLs, eliminating the v0.1.0 "silent false success" risk where an under-privileged run produced zero-row CSVs with exit code 0.
+  - **`-IncludeNamingContexts` non-empty validation**: aborts on a typo or empty match (data block includes both requested and discovered NC types for diagnosis).
+- **`Submit-RunspaceWorkItem` + `Receive-RunspaceHandle`** (`scripts/lib/Phase3-AceParsing.ps1`). Split out from `Invoke-RunspacePoolWork` so the orchestrator can dispatch Phase 2 batches into the runspace pool the moment they arrive (plan §12 interleaved pipeline), then drain at the end. Removes the inline `BeginInvoke`/`EndInvoke` loop from the entry script. `Receive-RunspaceHandle` also captures non-terminating `Streams.Error` records on each pipeline (previously dropped).
+- **CrossDomain trustee classification** (`scripts/lib/Phase4-TrusteeResolution.ps1`). New `PrincipalType` value for trustees whose SID translates via LSA but does not exist in the local directory (trusted-forest / external principals). Distinct from `WellKnown` (built-in / NT AUTHORITY) and `Orphaned` (no Translate).
+- **`Expand-GroupTransitive` truncation warning** (`scripts/lib/Phase4-TrusteeResolution.ps1:608`). Emits a `Write-Warning` when the `MaxMembers` cap is hit, so operators know the expansion was incomplete (previously silent).
+- **`Get-PageResultControl`** (`scripts/lib/Phase1-DiscoveryAndMaps.ps1`). Extracted from `Read-LdapEntry`'s paging loop so the cookie continuation can be unit-tested with a duck-typed fake response.
+- **Tests** (`Tests/Phase{1,3,4,5,6}-*.Tests.ps1`): six new unit cases.
+  - Phase 3 — `Invoke-AceParsingWorkUnit` against a row with `NTSecurityDescriptor = $null` emits a `PARSE_ERROR` placeholder.
+  - Phase 1 — `Read-LdapEntry` paging continuation across two pages (mocked `Get-PageResultControl`).
+  - Phase 4 — `Expand-GroupTransitive` caps at `-MaxMembers` and emits the warning.
+  - Phase 4 — `Resolve-TrusteeSid` classifies CrossDomain.
+  - Phase 5 — `Resolve-InheritanceSource` parent walk stops at the Configuration NC root and does not cross into the Domain NC.
+  - Phase 6 — `Write-DetailCsv` `ProgressCallback` fires every `-ProgressInterval` rows with the expected counter.
+
+### Changed
+
+- **Phase 6 row-build inlined** (ADR-028). `ConvertTo-DetailRow` deleted; its body moved directly into `Write-DetailCsv`'s `foreach ($tuple in $tuples)` loop with per-ACE caching of invariant fields and a reused `[string[]]` row buffer. Removes the per-row hashtable + values-array + escaped-array allocation triple at the ~5M-row design ceiling. `New-CsvFieldEscaper` is retained exactly per ADR-019. Phase 6 tests reworked to drive `Write-DetailCsv` end-to-end via `Import-Csv`.
+- **Pivot CSV ships with UTF-8 BOM** (ADR-018 amended). `scripts/lib/Phase6-Output.ps1:914` switched to `[UTF8Encoding]::new($true)` so Excel on Windows renders non-ASCII DNs and trustee names correctly without a manual import step. Detail CSV remains BOM-less for batch consumers (Power BI, pandas, SIEM).
+- **Phase 5 anomaly EventName renamed** (ADR-016 amended). `InheritedAceOnProtectedDacl` log events use `EventName = 'InheritedAceOnProtectedDacl'` (was `'BatchError'`) so they're distinct from Phase 3 runspace-batch failures in log analysis. The `reason` data field is preserved for back-compat.
+- **`Invoke-RunspacePoolWork`** now delegates internally to `Submit-RunspaceWorkItem` + `Receive-RunspaceHandle`. Public signature unchanged; existing tests pass without modification.
+- **Phase 3 inline drain replaced** with `Receive-RunspaceHandle` call in `scripts/Invoke-ADPermissionAnalysis.ps1`. The orchestrator iterates new ErrorBag entries post-drain to fan them out to `Write-LogEvent` with Phase 3 metadata.
+- **Test style** — three lingering `ForEach-Object` invocations replaced with `.ForEach({})` or pipe form (`Tests/Phase3-*.ps1`, `Tests/Phase4-*.ps1`).
+- **`Read-LdapEntry`** drops its `[SearchResponse]` cast on the response from `SendRequest` so duck-typed fakes work; production type narrowing is now implicit in the property access pattern.
+
+### Fixed
+
+- **Domain SID removed from Phase 4 PhaseEnd log event** (`scripts/Invoke-ADPermissionAnalysis.ps1`). The JSONL log no longer carries a real domain identifier — closes a `_meta/security.md` policy violation surfaced by the v0.1.0 review.
+- **`[int]` → `[long]` elapsed-ms casts** (9 sites across orchestrator + `Phase6-Output.ps1`). Prevents negative elapsed-time values in JSONL logs for phases running longer than ~24 days (the `[int32]` rollover boundary in milliseconds).
+- **`$script:LogWriter.AutoFlush = $false`** (`scripts/Invoke-ADPermissionAnalysis.ps1:251`). Removes per-event syscall cost on slow storage; the finally block already flushes + disposes on exit.
+- **`ThreadCount` doc / range alignment** (`scripts/Invoke-ADPermissionAnalysis.ps1:58-59`). Docstring now explicitly states the 1-32 accepted range alongside the practical 8-16 sweet spot.
+
+
 
 First release. Implements the six-phase orchestration from plan §18 steps 1–8 (steps 9–10 cancelled by ADR-025: no lab DC available). Ships without live-LDAP smoke validation; first operational run is exploratory. Correctness rests on 144 Pester unit cases across `scripts/lib/` (91.22% command coverage, gated at 86% per ADR-026).
 
