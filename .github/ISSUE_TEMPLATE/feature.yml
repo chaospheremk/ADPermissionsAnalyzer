@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a new capability or enhancement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve? What's the current limitation?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this addressed? Sketch the parameter surface, output, or behavior change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you consider? Why are they less suitable?
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope (in / out)
+      description: |
+        What should and should not be included? See the design spec §2 for examples of scope decisions the project has already locked down (SACL, multi-domain, risky-pattern flagging, etc.).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I have checked existing issues and the changelog for similar requests.
+          required: true
+        - label: This is not a request to add functionality explicitly excluded by the design spec §2.
+          required: false

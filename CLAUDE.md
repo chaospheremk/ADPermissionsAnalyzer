@@ -1,3 +1,10 @@
+> **Note for external readers**: This file documents internal Claude Code
+> session conventions used by the maintainer. References to `../bugs.md`,
+> `../decisions.md`, `../key-facts.md`, and `../issues.md` point to a private
+> developer notebook that lives outside this repository; those paths do not
+> resolve in a fresh clone. If you are contributing, see
+> [CONTRIBUTING.md](CONTRIBUTING.md) instead.
+
 # Code Session — `AD Permissions Analyzer`
 
 ## Context
@@ -88,5 +95,5 @@ Before ending a code session:
 This folder is its own git repository.
 Push directly to this project's GitHub remote.
 Do not use the vault's 50-Outputs/ for this project's code.
-Dev branch + PR workflow — never commit directly to main.
+Trunk-based: branch per PR from `main`, delete after merge. Never commit directly to `main`.
 Pre-commit hooks must be installed: `pip install pre-commit && pre-commit install`

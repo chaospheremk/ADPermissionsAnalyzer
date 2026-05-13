@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a defect in ADPermissionsAnalyzer
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please redact real DNs, SIDs,
+        trustee names, and hostnames from any log excerpts before posting.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect to happen?
+      placeholder: |
+        Steps to reproduce:
+        1. Ran `.\scripts\Invoke-ADPermissionAnalysis.ps1 -OutputDirectory ...`
+        2. Observed ...
+        Expected ...
+    validations:
+      required: true
+
+  - type: input
+    id: powershell-version
+    attributes:
+      label: PowerShell version
+      description: Output of `$PSVersionTable.PSVersion`
+      placeholder: "7.4.6"
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: e.g. Windows 11 23H2, Windows Server 2022
+      placeholder: "Windows Server 2022"
+    validations:
+      required: true
+
+  - type: input
+    id: project-version
+    attributes:
+      label: ADPermissionsAnalyzer version
+      description: Version tag or commit SHA
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: parameters
+    attributes:
+      label: Invocation
+      description: The parameters you passed (REDACT real domain/server/credential values)
+      render: powershell
+      placeholder: |
+        $params = @{
+            Domain                = '<redacted>'
+            OutputDirectory       = 'C:\AdPermAudit'
+            ThreadCount           = 8
+            IncludeNamingContexts = @('Domain', 'Configuration')
+        }
+        .\scripts\Invoke-ADPermissionAnalysis.ps1 @params
+    validations:
+      required: false
+
+  - type: textarea
+    id: log-excerpt
+    attributes:
+      label: Relevant JSONL log excerpt
+      description: Events around the failure. Redact real identifiers.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message / stack trace
+      render: text
+    validations:
+      required: false

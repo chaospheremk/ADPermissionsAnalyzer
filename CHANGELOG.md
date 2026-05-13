@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `LICENSE` — MIT.
+- `SECURITY.md` — vulnerability disclosure policy (GitHub Security Advisories preferred, fallback email).
+- `CONTRIBUTING.md` — trunk-based branching model, local setup, style rules, PR checklist.
+- `CODE_OF_CONDUCT.md` — adopts Contributor Covenant 2.1 by reference.
+- `.github/ISSUE_TEMPLATE/{bug,feature,config}.yml` and `.github/pull_request_template.md`.
+
+### Changed
+
+- `README.md` — full public-facing rewrite. Replaces template placeholders with project description, prerequisites, quick-start, output schema overview, and links to runbook/spec/changelog.
+- `mkdocs.yml` — fixed `<repo-name>` placeholder in `repo_url` / `repo_name`.
+- `CLAUDE.md` — prepended external-readers disclaimer; updated branching reference from "Dev branch + PR workflow" to "Trunk-based: branch per PR from `main`, delete after merge."
+- **Branching model** — repo switches from permanent `dev` branch with `dev → main` PRs to trunk-based with short-lived branches off `main`. The `.github/workflows/sync-dev.yml` workflow and the `dev` branch itself will be retired in a follow-up.
+
 ## [0.2.0] - 2026-05-11
 
 v0.1.0 hardening release. Driven by a fresh-context code review run between v0.1.0 and the first work-environment test. Closes out correctness, security, performance, ergonomics, and test-coverage findings before the first live-LDAP run. Coverage moves from 91.22% to 93.22% (gated at 86% per ADR-026).
