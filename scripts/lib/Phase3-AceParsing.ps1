@@ -502,8 +502,12 @@ function Submit-RunspaceWorkItem {
     .DESCRIPTION
         Creates a [powershell] pipeline bound to -Pool, adds -WorkUnit as
         the script and -Item as its positional argument, then BeginInvokes.
-        Returns a PSCustomObject {PowerShell, Handle, Item, Index, Metadata}
-        that Receive-RunspaceHandle accepts.
+        Returns a PSCustomObject {PowerShell, Handle, Index, Metadata}
+        that Receive-RunspaceHandle accepts. The handle does NOT carry the
+        input -Item back: each handle would otherwise pin a reference to
+        its 250-object batch (with binary nTSecurityDescriptor blobs) that
+        no consumer reads, blocking GC until the runspace pool drains.
+        See docs/session-changes-2025-05-15.md §5a.
 
         Extracted from Invoke-RunspacePoolWork (plan §12) so the entry
         script can pipeline Phase 2 batches into the Phase 3 pool as they
@@ -556,7 +560,6 @@ function Submit-RunspaceWorkItem {
     [PSCustomObject]@{
         PowerShell = $ps
         Handle     = $ps.BeginInvoke()
-        Item       = $Item
         Index      = $Index
         Metadata   = $Metadata
     }
