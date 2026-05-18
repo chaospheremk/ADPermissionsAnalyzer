@@ -1,8 +1,10 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
 using namespace System.Security.Principal
 using namespace System.Text
+
+# SDP types use fully-qualified names — see Phase1-DiscoveryAndMaps.ps1 header
+# and docs/session-changes-2025-05-15.md §1.
 
 <#
 .SYNOPSIS
@@ -139,7 +141,7 @@ function Get-DomainSid {
         Filter           = '(objectClass=*)'
         Attributes       = @('objectSid')
         BinaryAttributes = @('objectSid')
-        Scope            = [SearchScope]::Base
+        Scope            = [System.DirectoryServices.Protocols.SearchScope]::Base
     }
     $entries = Invoke-PagedLdapSearch @searchParams
     if ($entries.Count -eq 0) {

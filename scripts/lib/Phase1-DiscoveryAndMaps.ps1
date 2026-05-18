@@ -1,6 +1,12 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
+
+# Note: System.DirectoryServices.Protocols (SDP) types are referenced via their
+# fully-qualified names throughout this file. PS 7.5.4 lazy-compiles dot-sourced
+# function bodies — by the time a body is first invoked, the parent file's
+# `using namespace` scope has been lost and short SDP type names fail to
+# resolve. The entry script does Add-Type for the SDP assembly before
+# dot-sourcing this file. See docs/session-changes-2025-05-15.md §1, §4.
 
 <#
 .SYNOPSIS
@@ -38,7 +44,7 @@ function Connect-AdLdap {
         Optional alternate credential. Default: current process identity.
     #>
     [CmdletBinding()]
-    [OutputType([LdapConnection])]
+    [OutputType([System.DirectoryServices.Protocols.LdapConnection])]
     param(
         [Parameter()]
         [string] $Server,
@@ -58,9 +64,9 @@ function Connect-AdLdap {
         throw 'No -Server or -Domain provided and $env:USERDNSDOMAIN is empty.'
     }
 
-    $identifier = [LdapDirectoryIdentifier]::new($target, 389, $false, $true)
-    $connection = [LdapConnection]::new($identifier)
-    $connection.AuthType = [AuthType]::Negotiate
+    $identifier = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($target, 389, $false, $true)
+    $connection = [System.DirectoryServices.Protocols.LdapConnection]::new($identifier)
+    $connection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
     if ($Credential) {
         $connection.Credential = $Credential.GetNetworkCredential()
     }
@@ -133,18 +139,18 @@ function Read-LdapEntry {
         [string[]] $BinaryAttributes = @(),
 
         [Parameter()]
-        [DirectoryControl[]] $AdditionalControls = @(),
+        [System.DirectoryServices.Protocols.DirectoryControl[]] $AdditionalControls = @(),
 
         [Parameter()]
         [ValidateRange(1, 5000)]
         [int] $PageSize = 1000,
 
         [Parameter()]
-        [SearchScope] $Scope = [SearchScope]::Subtree
+        [System.DirectoryServices.Protocols.SearchScope] $Scope = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     )
 
-    $request     = [SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
-    $pageControl = [PageResultRequestControl]::new($PageSize)
+    $request     = [System.DirectoryServices.Protocols.SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
+    $pageControl = [System.DirectoryServices.Protocols.PageResultRequestControl]::new($PageSize)
     [void] $request.Controls.Add($pageControl)
     foreach ($ctrl in $AdditionalControls) {
         [void] $request.Controls.Add($ctrl)
@@ -192,12 +198,12 @@ function Get-PageResultControl {
         Extracted from Read-LdapEntry so the paging-cookie continuation can
         be unit-tested with a duck-typed fake response. Production behaviour
         is unchanged: walks $Response.Controls, returns the first
-        [PageResultResponseControl], else $null. Pester tests override this
+        [System.DirectoryServices.Protocols.PageResultResponseControl], else $null. Pester tests override this
         function via Mock to drive Read-LdapEntry through a synthetic
         two-page sequence.
     #>
     [CmdletBinding()]
-    [OutputType([PageResultResponseControl])]
+    [OutputType([System.DirectoryServices.Protocols.PageResultResponseControl])]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNull()]
@@ -205,7 +211,7 @@ function Get-PageResultControl {
     )
 
     foreach ($control in $Response.Controls) {
-        if ($control -is [PageResultResponseControl]) {
+        if ($control -is [System.DirectoryServices.Protocols.PageResultResponseControl]) {
             return $control
         }
     }
@@ -270,7 +276,7 @@ function Invoke-PagedLdapSearch {
         [int] $PageSize = 1000,
 
         [Parameter()]
-        [SearchScope] $Scope = [SearchScope]::Subtree
+        [System.DirectoryServices.Protocols.SearchScope] $Scope = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     )
 
     $results = [List[hashtable]]::new()
@@ -332,7 +338,7 @@ function Get-ADNamingContext {
     [OutputType([List[PSObject]])]
     param(
         [Parameter(Mandatory)]
-        [LdapConnection] $Connection
+        [System.DirectoryServices.Protocols.LdapConnection] $Connection
     )
 
     $rootAttrs = @(
@@ -342,8 +348,8 @@ function Get-ADNamingContext {
         'schemaNamingContext'
         'rootDomainNamingContext'
     )
-    $request  = [SearchRequest]::new('', '(objectClass=*)', [SearchScope]::Base, $rootAttrs)
-    $response = [SearchResponse] $Connection.SendRequest($request)
+    $request  = [System.DirectoryServices.Protocols.SearchRequest]::new('', '(objectClass=*)', [System.DirectoryServices.Protocols.SearchScope]::Base, $rootAttrs)
+    $response = [System.DirectoryServices.Protocols.SearchResponse] $Connection.SendRequest($request)
     if ($response.Entries.Count -eq 0) {
         throw 'RootDSE search returned no entries.'
     }
