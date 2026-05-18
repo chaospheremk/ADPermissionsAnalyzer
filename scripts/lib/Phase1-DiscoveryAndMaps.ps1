@@ -64,8 +64,17 @@ function Connect-AdLdap {
         throw 'No -Server or -Domain provided and $env:USERDNSDOMAIN is empty.'
     }
 
-    $identifier = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($target, 389, $false, $true)
+    # connectionless=$false (TCP, not UDP): UDP cannot carry paged-result
+    # controls or binary attributes. ProtocolVersion=3: required for paged
+    # controls + SecurityDescriptorFlagControl. ReferralChasing=None: with
+    # the default 'All', the DC chases subordinate referrals to
+    # DomainDnsZones / ForestDnsZones partitions, inflates the first page
+    # past PageSize, and corrupts the paging continuation cookie so page-2
+    # throws LdapException. See docs/session-changes-2025-05-15.md §2.
+    $identifier = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($target, 389, $false, $false)
     $connection = [System.DirectoryServices.Protocols.LdapConnection]::new($identifier)
+    $connection.SessionOptions.ProtocolVersion = 3
+    $connection.SessionOptions.ReferralChasing = [System.DirectoryServices.Protocols.ReferralChasingOptions]::None
     $connection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
     if ($Credential) {
         $connection.Credential = $Credential.GetNetworkCredential()
