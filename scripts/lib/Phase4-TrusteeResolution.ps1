@@ -230,19 +230,28 @@ function Test-IsTerminalSid {
     [bool] ($SkipSet.Contains($Sid) -or $Sid -like 'S-1-5-32-*')
 }
 
-function Get-DistinctTrusteeSet {
+function Get-DistinctTrusteeSetFromStream {
     <#
     .SYNOPSIS
-        Single-pass dedupe over $aceRecords, returning every distinct
-        TrusteeSid (case-insensitive).
+        Streaming variant of Get-DistinctTrusteeSet: dedupe TrusteeSid
+        values across a Phase 3 CLIXML batch file without materialising
+        the whole record set in memory.
 
     .DESCRIPTION
-        Plan §6: 30k objects × ~30 ACEs ≈ 900k rows but typically <5k
-        distinct trustees. Deduping before resolution keeps Phase 4 well
-        under the LDAP-throughput budget. Returned set covers both real
-        DACL ACEs and synthetic-Owner rows since both populate
-        TrusteeSid identically. Empty-string and null TrusteeSid values
-        (PARSE_ERROR placeholders) are skipped.
+        Iterates the file via Read-AceStream (defined in
+        Phase3-AceParsing.ps1) and accumulates each non-empty TrusteeSid
+        into a case-insensitive HashSet. Same dedupe semantics as the
+        in-memory Get-DistinctTrusteeSet — drops empty / null TrusteeSid
+        values (PARSE_ERROR placeholders).
+
+        Used by the entry script in Phase 4 to enumerate trustees without
+        keeping the post-Phase-3 ACE list resident. Per ADR-030, the
+        in-memory $aceRecords list has been replaced with a disk-backed
+        stream; this is the consumer for the distinct-trustee pass.
+
+    .PARAMETER Phase3AceRecordsPath
+        Path to the Phase 3 CLIXML batch file produced by
+        Write-AceBatchToStream.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
@@ -251,12 +260,12 @@ function Get-DistinctTrusteeSet {
     [OutputType([HashSet[string]])]
     param(
         [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [List[PSObject]] $AceRecords
+        [ValidateNotNullOrEmpty()]
+        [string] $Phase3AceRecordsPath
     )
 
     $set = [HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($ace in $AceRecords) {
+    foreach ($ace in (Read-AceStream -Path $Phase3AceRecordsPath)) {
         $sid = $ace.TrusteeSid
         if ($sid) {
             [void] $set.Add($sid)

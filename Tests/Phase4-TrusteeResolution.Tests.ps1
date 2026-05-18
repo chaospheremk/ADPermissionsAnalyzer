@@ -8,6 +8,9 @@ using namespace System.Security.Principal
 BeforeAll {
     $script:LibDir = Join-Path $PSScriptRoot '../scripts/lib'
     . (Join-Path $script:LibDir 'Phase1-DiscoveryAndMaps.ps1')
+    # Phase 3 lib hosts the streaming primitives (Write-AceBatchToStream,
+    # Read-AceStream) used by Phase 4's Get-DistinctTrusteeSetFromStream.
+    . (Join-Path $script:LibDir 'Phase3-AceParsing.ps1')
     . (Join-Path $script:LibDir 'Phase4-TrusteeResolution.ps1')
 
     function New-FakeLdapConnection {
@@ -140,17 +143,58 @@ Describe 'Test-IsTerminalSid' {
     }
 }
 
-Describe 'Get-DistinctTrusteeSet' {
+Describe 'Get-DistinctTrusteeSetFromStream' {
+    BeforeAll {
+        $script:Phase4StreamDir = Join-Path ([System.IO.Path]::GetTempPath()) ("phase4-stream-{0}" -f ([guid]::NewGuid()))
+        New-Item -ItemType Directory -Path $script:Phase4StreamDir -Force | Out-Null
+
+        function Write-AceFixtureFile {
+            [CmdletBinding()]
+            param(
+                [Parameter(Mandatory)] [string] $Path,
+                [Parameter(Mandatory)] [List[PSObject]] $Records,
+                [Parameter()] [int] $BatchSize = 50
+            )
+            $writer = [System.IO.StreamWriter]::new($Path, $false, [System.Text.UTF8Encoding]::new($false))
+            try {
+                $buf = [List[PSObject]]::new($BatchSize)
+                foreach ($r in $Records) {
+                    $buf.Add($r)
+                    if ($buf.Count -ge $BatchSize) {
+                        Write-AceBatchToStream -Writer $writer -Records $buf
+                        $buf.Clear()
+                    }
+                }
+                if ($buf.Count -gt 0) {
+                    Write-AceBatchToStream -Writer $writer -Records $buf
+                }
+                $writer.Flush()
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+    }
+
+    AfterAll {
+        if (Test-Path -LiteralPath $script:Phase4StreamDir) {
+            Remove-Item -LiteralPath $script:Phase4StreamDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'dedupes across DACL ACEs and synthetic-Owner rows, dropping empty TrusteeSid' {
         $records = [List[PSObject]]::new()
-        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid; AceType = 'AccessAllowed' })
-        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid; AceType = 'AccessAllowed' })   # dup
+        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid;  AceType = 'AccessAllowed' })
+        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid;  AceType = 'AccessAllowed' })   # dup
         $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestGroupSid; AceType = 'AccessAllowed' })
-        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid; AceType = 'Synthetic.Owner' }) # owner-row dup
+        $records.Add([PSCustomObject]@{ TrusteeSid = $script:TestUserSid;  AceType = 'Synthetic.Owner' }) # owner-row dup
         $records.Add([PSCustomObject]@{ TrusteeSid = '';                   AceType = 'PARSE_ERROR' })   # placeholder
 
-        $set = Get-DistinctTrusteeSet -AceRecords $records
-        $set.Count | Should -Be 2
+        $path = Join-Path $script:Phase4StreamDir ("distinct-{0}.clixml" -f ([guid]::NewGuid()))
+        Write-AceFixtureFile -Path $path -Records $records
+
+        $set = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $path
+        $set.Count                          | Should -Be 2
         $set.Contains($script:TestUserSid)  | Should -BeTrue
         $set.Contains($script:TestGroupSid) | Should -BeTrue
     }
@@ -160,8 +204,17 @@ Describe 'Get-DistinctTrusteeSet' {
         $records.Add([PSCustomObject]@{ TrusteeSid = 'S-1-5-18' })
         $records.Add([PSCustomObject]@{ TrusteeSid = 's-1-5-18' })
 
-        $set = Get-DistinctTrusteeSet -AceRecords $records
+        $path = Join-Path $script:Phase4StreamDir ("distinct-ci-{0}.clixml" -f ([guid]::NewGuid()))
+        Write-AceFixtureFile -Path $path -Records $records
+
+        $set = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $path
         $set.Count | Should -Be 1
+    }
+
+    It 'returns an empty set when the input file does not exist' {
+        $missing = Join-Path $script:Phase4StreamDir 'does-not-exist.clixml'
+        $set = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $missing
+        $set.Count | Should -Be 0
     }
 }
 
