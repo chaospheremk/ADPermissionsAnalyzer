@@ -158,29 +158,41 @@ function Read-LdapEntry {
         [System.DirectoryServices.Protocols.SearchScope] $Scope = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     )
 
-    $request     = [System.DirectoryServices.Protocols.SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
-    $pageControl = [System.DirectoryServices.Protocols.PageResultRequestControl]::new($PageSize)
-    [void] $request.Controls.Add($pageControl)
-    foreach ($ctrl in $AdditionalControls) {
-        [void] $request.Controls.Add($ctrl)
-    }
-
     $binarySet = [HashSet[string]]::new(
         [string[]] $BinaryAttributes,
         [System.StringComparer]::OrdinalIgnoreCase)
 
+    $cookie = $null
     while ($true) {
+        # Build a fresh SearchRequest each page to avoid .NET 9 BER
+        # re-encoding issues when the PageResultRequestControl cookie is
+        # mutated on a reused request alongside other controls. Pass $null
+        # to the constructor's attributes parameter so PowerShell does not
+        # bind [string[]] $Attributes via the `params string[]` overload —
+        # that double-wraps the array and produces a malformed attribute
+        # list. AddRange is the correct path. Casts on attribute values
+        # below preserve the byte[]/string[] shape callers expect. See
+        # docs/session-changes-2025-05-15.md §3a-3b.
+        $request = [System.DirectoryServices.Protocols.SearchRequest]::new($SearchBase, $Filter, $Scope, $null)
+        if ($Attributes) { [void] $request.Attributes.AddRange($Attributes) }
+        $pageControl = [System.DirectoryServices.Protocols.PageResultRequestControl]::new($PageSize)
+        if ($cookie) { $pageControl.Cookie = $cookie }
+        [void] $request.Controls.Add($pageControl)
+        foreach ($ctrl in $AdditionalControls) {
+            [void] $request.Controls.Add($ctrl)
+        }
+
         $response = $Connection.SendRequest($request)
 
         foreach ($entry in $response.Entries) {
             $attrs = @{}
             foreach ($name in $entry.Attributes.AttributeNames) {
                 $attr = $entry.Attributes[$name]
-                $attrs[$name] = if ($binarySet.Contains($name)) {
-                    $attr.GetValues([byte[]])
+                if ($binarySet.Contains($name)) {
+                    $attrs[$name] = [object[]] $attr.GetValues([byte[]])
                 }
                 else {
-                    $attr.GetValues([string])
+                    $attrs[$name] = [string[]] $attr.GetValues([string])
                 }
             }
             @{
@@ -193,7 +205,7 @@ function Read-LdapEntry {
         if ($null -eq $pageResp -or $pageResp.Cookie.Length -eq 0) {
             break
         }
-        $pageControl.Cookie = $pageResp.Cookie
+        $cookie = $pageResp.Cookie
     }
 }
 
@@ -357,7 +369,10 @@ function Get-ADNamingContext {
         'schemaNamingContext'
         'rootDomainNamingContext'
     )
-    $request  = [System.DirectoryServices.Protocols.SearchRequest]::new('', '(objectClass=*)', [System.DirectoryServices.Protocols.SearchScope]::Base, $rootAttrs)
+    # AddRange pattern instead of constructor-attribute parameter — see
+    # Read-LdapEntry comment / session-changes §3a.
+    $request  = [System.DirectoryServices.Protocols.SearchRequest]::new('', '(objectClass=*)', [System.DirectoryServices.Protocols.SearchScope]::Base, $null)
+    [void] $request.Attributes.AddRange($rootAttrs)
     $response = [System.DirectoryServices.Protocols.SearchResponse] $Connection.SendRequest($request)
     if ($response.Entries.Count -eq 0) {
         throw 'RootDSE search returned no entries.'
