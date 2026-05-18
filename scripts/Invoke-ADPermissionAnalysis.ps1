@@ -1,8 +1,13 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
 using namespace System.IO
 using namespace System.Text
+
+# System.DirectoryServices.Protocols types are referenced via fully-qualified
+# names throughout this codebase. The SDP assembly is loaded eagerly via
+# Add-Type (further down) before dot-sourcing the lib files — `using assembly`
+# is unreliable on PS 7.5.x for SDP. See docs/session-changes-2025-05-15.md
+# §1, §4.
 
 <#
 .SYNOPSIS
@@ -144,6 +149,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Load SDP assembly at runtime BEFORE dot-sourcing lib files that use SDP
+# types. PS 7.5.x cannot resolve SDP types via `using assembly`; Add-Type at
+# script start ensures the types are in the AppDomain when lib function
+# bodies are first lazily compiled at invocation time.
+Add-Type -AssemblyName System.DirectoryServices.Protocols
 
 $script:Phase1LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1'
 $script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1'
@@ -369,8 +380,8 @@ try {
     #     on the domain NC root. Without this check, an account that lacks
     #     DACL-read rights produces a zero-row CSV with exit code 0 — a silent
     #     false success that misleads the operator. Fail loudly instead.
-    $preflightSdControl = [SecurityDescriptorFlagControl]::new(
-        [SecurityMasks]::Owner -bor [SecurityMasks]::Dacl)
+    $preflightSdControl = [System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new(
+        [System.DirectoryServices.Protocols.SecurityMasks]::Owner -bor [System.DirectoryServices.Protocols.SecurityMasks]::Dacl)
     $preflightSearchParams = @{
         Connection         = $script:LdapConnection
         SearchBase         = $domainContext.DistinguishedName
@@ -378,7 +389,7 @@ try {
         Attributes         = @('nTSecurityDescriptor')
         BinaryAttributes   = @('nTSecurityDescriptor')
         AdditionalControls = , $preflightSdControl
-        Scope              = [SearchScope]::Base
+        Scope              = [System.DirectoryServices.Protocols.SearchScope]::Base
     }
     $preflightSdBytes = $null
     foreach ($entry in (Read-LdapEntry @preflightSearchParams)) {
