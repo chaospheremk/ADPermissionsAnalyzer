@@ -1,8 +1,13 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
 using namespace System.IO
 using namespace System.Text
+
+# System.DirectoryServices.Protocols types are referenced via fully-qualified
+# names throughout this codebase. The SDP assembly is loaded eagerly via
+# Add-Type (further down) before dot-sourcing the lib files — `using assembly`
+# is unreliable on PS 7.5.x for SDP. See docs/session-changes-2025-05-15.md
+# §1, §4.
 
 <#
 .SYNOPSIS
@@ -144,6 +149,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Load SDP assembly at runtime BEFORE dot-sourcing lib files that use SDP
+# types. PS 7.5.x cannot resolve SDP types via `using assembly`; Add-Type at
+# script start ensures the types are in the AppDomain when lib function
+# bodies are first lazily compiled at invocation time.
+Add-Type -AssemblyName System.DirectoryServices.Protocols
 
 $script:Phase1LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase1-DiscoveryAndMaps.ps1'
 $script:Phase2LibPath = Join-Path -Path $PSScriptRoot -ChildPath 'lib/Phase2-Enumeration.ps1'
@@ -369,8 +380,8 @@ try {
     #     on the domain NC root. Without this check, an account that lacks
     #     DACL-read rights produces a zero-row CSV with exit code 0 — a silent
     #     false success that misleads the operator. Fail loudly instead.
-    $preflightSdControl = [SecurityDescriptorFlagControl]::new(
-        [SecurityMasks]::Owner -bor [SecurityMasks]::Dacl)
+    $preflightSdControl = [System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new(
+        [System.DirectoryServices.Protocols.SecurityMasks]::Owner -bor [System.DirectoryServices.Protocols.SecurityMasks]::Dacl)
     $preflightSearchParams = @{
         Connection         = $script:LdapConnection
         SearchBase         = $domainContext.DistinguishedName
@@ -378,7 +389,7 @@ try {
         Attributes         = @('nTSecurityDescriptor')
         BinaryAttributes   = @('nTSecurityDescriptor')
         AdditionalControls = , $preflightSdControl
-        Scope              = [SearchScope]::Base
+        Scope              = [System.DirectoryServices.Protocols.SearchScope]::Base
     }
     $preflightSdBytes = $null
     foreach ($entry in (Read-LdapEntry @preflightSearchParams)) {
@@ -465,7 +476,15 @@ try {
         Invoke-AceParsingWorkUnit @params
     }
 
-    $handles = [System.Collections.Generic.List[PSObject]]::new()
+    $handles      = [System.Collections.Generic.List[PSObject]]::new()
+    $aceRecords   = [System.Collections.Generic.List[PSObject]]::new()
+    $totalBatches = 0
+    # Drain completed handles whenever pending count crosses this threshold.
+    # Caps live [powershell] pipelines at ~2× the runspace pool size, so
+    # pipeline buffers and parsed-ACE memory are released incrementally
+    # during enumeration instead of all at once at end-of-Phase-3.
+    # See docs/session-changes-2025-05-15.md §5b-5f.
+    $drainThreshold = [Math]::Max($ThreadCount * 2, 8)
 
     foreach ($nc in $selectedNcs) {
         $ncStart           = [DateTime]::UtcNow
@@ -488,13 +507,52 @@ try {
                 Pool     = $script:Phase3Pool
                 WorkUnit = $workUnit
                 Item     = $batch
-                Index    = $handles.Count
+                Index    = $totalBatches
                 Metadata = @{
                     NamingContext = $nc.DistinguishedName
                     BatchSize     = $batch.Count
                 }
             }
             $handles.Add((Submit-RunspaceWorkItem @submitParams))
+            $totalBatches++
+
+            # --- Mid-enumeration drain: free completed pipelines -------------
+            # Scan backwards (so RemoveAt doesn't shift subsequent indices)
+            # for handles whose runspaces have finished, EndInvoke them,
+            # append parsed ACEs to $aceRecords, capture per-handle errors
+            # into $script:ErrorBag, and Dispose the PowerShell pipeline.
+            if ($handles.Count -ge $drainThreshold) {
+                for ($di = $handles.Count - 1; $di -ge 0; $di--) {
+                    $h = $handles[$di]
+                    if (-not $h.Handle.IsCompleted) { continue }
+                    try {
+                        $output = $h.PowerShell.EndInvoke($h.Handle)
+                        foreach ($o in $output) { $aceRecords.Add($o) }
+                        if ($h.PowerShell.Streams.Error.Count -gt 0) {
+                            foreach ($err in $h.PowerShell.Streams.Error) {
+                                $script:ErrorBag.Add([PSCustomObject]@{
+                                    Event    = 'BatchError'
+                                    Index    = $h.Index
+                                    Error    = $err.Exception.Message
+                                    Metadata = $h.Metadata
+                                })
+                            }
+                        }
+                    }
+                    catch {
+                        $script:ErrorBag.Add([PSCustomObject]@{
+                            Event    = 'BatchError'
+                            Index    = $h.Index
+                            Error    = $_.Exception.Message
+                            Metadata = $h.Metadata
+                        })
+                    }
+                    finally {
+                        $h.PowerShell.Dispose()
+                    }
+                    $handles.RemoveAt($di)
+                }
+            }
 
             if ($sinceLastProgress -ge $progressIntervalObjects) {
                 $progressParams = @{
@@ -506,6 +564,8 @@ try {
                         namingContext = $nc.DistinguishedName
                         ncObjectCount = $ncObjectCount
                         totalObjects  = $totalObjects
+                        pendingDrains = $handles.Count
+                        acesCollected = $aceRecords.Count
                     }
                 }
                 Write-LogEvent @progressParams
@@ -513,7 +573,7 @@ try {
                 $writeProgressParams = @{
                     Activity         = 'AD Permissions Analyzer - Phase 2'
                     Status           = "$($nc.DistinguishedName): $ncObjectCount objects"
-                    CurrentOperation = "Total enumerated: $totalObjects"
+                    CurrentOperation = "Total: $totalObjects | Pending: $($handles.Count) | ACEs: $($aceRecords.Count)"
                 }
                 Write-Progress @writeProgressParams
 
@@ -563,11 +623,18 @@ try {
     }
     Write-LogEvent @phase2EndParams
 
-    # --- Phase 3 drain: collect parsed ACE records from queued runspaces ---
-    # Receive-RunspaceHandle captures terminating + non-terminating errors per
-    # handle into $script:ErrorBag; we fan those out to the JSONL log here.
+    # --- Phase 3 final drain: collect stragglers ---------------------------
+    # The mid-enumeration drain inside the foreach loop already freed
+    # pipelines as they completed and appended their ACE output to
+    # $aceRecords. Any remaining handles here were still in-flight when
+    # enumeration finished; Receive-RunspaceHandle blocks on them and
+    # captures per-handle errors into $script:ErrorBag.
     $preDrainErrorCount = $script:ErrorBag.Count
-    $aceRecords = Receive-RunspaceHandle -Handles $handles -ErrorBag $script:ErrorBag
+    if ($handles.Count -gt 0) {
+        $finalDrained = Receive-RunspaceHandle -Handles $handles -ErrorBag $script:ErrorBag
+        foreach ($o in $finalDrained) { $aceRecords.Add($o) }
+        $handles.Clear()
+    }
     for ($i = $preDrainErrorCount; $i -lt $script:ErrorBag.Count; $i++) {
         $err = $script:ErrorBag[$i]
         $errMeta = $err.Metadata
@@ -593,7 +660,7 @@ try {
         Data      = @{
             totalObjects = $totalObjects
             totalAces    = $aceRecords.Count
-            batchCount   = $handles.Count
+            batchCount   = $totalBatches
             elapsedMs    = $phase3ElapsedMs
         }
     }

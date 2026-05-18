@@ -1,6 +1,12 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
+
+# Note: System.DirectoryServices.Protocols (SDP) types are referenced via their
+# fully-qualified names throughout this file. PS 7.5.4 lazy-compiles dot-sourced
+# function bodies — by the time a body is first invoked, the parent file's
+# `using namespace` scope has been lost and short SDP type names fail to
+# resolve. The entry script does Add-Type for the SDP assembly before
+# dot-sourcing this file. See docs/session-changes-2025-05-15.md §1, §4.
 
 <#
 .SYNOPSIS
@@ -38,7 +44,7 @@ function Connect-AdLdap {
         Optional alternate credential. Default: current process identity.
     #>
     [CmdletBinding()]
-    [OutputType([LdapConnection])]
+    [OutputType([System.DirectoryServices.Protocols.LdapConnection])]
     param(
         [Parameter()]
         [string] $Server,
@@ -58,9 +64,18 @@ function Connect-AdLdap {
         throw 'No -Server or -Domain provided and $env:USERDNSDOMAIN is empty.'
     }
 
-    $identifier = [LdapDirectoryIdentifier]::new($target, 389, $false, $true)
-    $connection = [LdapConnection]::new($identifier)
-    $connection.AuthType = [AuthType]::Negotiate
+    # connectionless=$false (TCP, not UDP): UDP cannot carry paged-result
+    # controls or binary attributes. ProtocolVersion=3: required for paged
+    # controls + SecurityDescriptorFlagControl. ReferralChasing=None: with
+    # the default 'All', the DC chases subordinate referrals to
+    # DomainDnsZones / ForestDnsZones partitions, inflates the first page
+    # past PageSize, and corrupts the paging continuation cookie so page-2
+    # throws LdapException. See docs/session-changes-2025-05-15.md §2.
+    $identifier = [System.DirectoryServices.Protocols.LdapDirectoryIdentifier]::new($target, 389, $false, $false)
+    $connection = [System.DirectoryServices.Protocols.LdapConnection]::new($identifier)
+    $connection.SessionOptions.ProtocolVersion = 3
+    $connection.SessionOptions.ReferralChasing = [System.DirectoryServices.Protocols.ReferralChasingOptions]::None
+    $connection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
     if ($Credential) {
         $connection.Credential = $Credential.GetNetworkCredential()
     }
@@ -133,39 +148,51 @@ function Read-LdapEntry {
         [string[]] $BinaryAttributes = @(),
 
         [Parameter()]
-        [DirectoryControl[]] $AdditionalControls = @(),
+        [System.DirectoryServices.Protocols.DirectoryControl[]] $AdditionalControls = @(),
 
         [Parameter()]
         [ValidateRange(1, 5000)]
         [int] $PageSize = 1000,
 
         [Parameter()]
-        [SearchScope] $Scope = [SearchScope]::Subtree
+        [System.DirectoryServices.Protocols.SearchScope] $Scope = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     )
-
-    $request     = [SearchRequest]::new($SearchBase, $Filter, $Scope, $Attributes)
-    $pageControl = [PageResultRequestControl]::new($PageSize)
-    [void] $request.Controls.Add($pageControl)
-    foreach ($ctrl in $AdditionalControls) {
-        [void] $request.Controls.Add($ctrl)
-    }
 
     $binarySet = [HashSet[string]]::new(
         [string[]] $BinaryAttributes,
         [System.StringComparer]::OrdinalIgnoreCase)
 
+    $cookie = $null
     while ($true) {
+        # Build a fresh SearchRequest each page to avoid .NET 9 BER
+        # re-encoding issues when the PageResultRequestControl cookie is
+        # mutated on a reused request alongside other controls. Pass $null
+        # to the constructor's attributes parameter so PowerShell does not
+        # bind [string[]] $Attributes via the `params string[]` overload —
+        # that double-wraps the array and produces a malformed attribute
+        # list. AddRange is the correct path. Casts on attribute values
+        # below preserve the byte[]/string[] shape callers expect. See
+        # docs/session-changes-2025-05-15.md §3a-3b.
+        $request = [System.DirectoryServices.Protocols.SearchRequest]::new($SearchBase, $Filter, $Scope, $null)
+        if ($Attributes) { [void] $request.Attributes.AddRange($Attributes) }
+        $pageControl = [System.DirectoryServices.Protocols.PageResultRequestControl]::new($PageSize)
+        if ($cookie) { $pageControl.Cookie = $cookie }
+        [void] $request.Controls.Add($pageControl)
+        foreach ($ctrl in $AdditionalControls) {
+            [void] $request.Controls.Add($ctrl)
+        }
+
         $response = $Connection.SendRequest($request)
 
         foreach ($entry in $response.Entries) {
             $attrs = @{}
             foreach ($name in $entry.Attributes.AttributeNames) {
                 $attr = $entry.Attributes[$name]
-                $attrs[$name] = if ($binarySet.Contains($name)) {
-                    $attr.GetValues([byte[]])
+                if ($binarySet.Contains($name)) {
+                    $attrs[$name] = [object[]] $attr.GetValues([byte[]])
                 }
                 else {
-                    $attr.GetValues([string])
+                    $attrs[$name] = [string[]] $attr.GetValues([string])
                 }
             }
             @{
@@ -178,7 +205,7 @@ function Read-LdapEntry {
         if ($null -eq $pageResp -or $pageResp.Cookie.Length -eq 0) {
             break
         }
-        $pageControl.Cookie = $pageResp.Cookie
+        $cookie = $pageResp.Cookie
     }
 }
 
@@ -192,12 +219,12 @@ function Get-PageResultControl {
         Extracted from Read-LdapEntry so the paging-cookie continuation can
         be unit-tested with a duck-typed fake response. Production behaviour
         is unchanged: walks $Response.Controls, returns the first
-        [PageResultResponseControl], else $null. Pester tests override this
+        [System.DirectoryServices.Protocols.PageResultResponseControl], else $null. Pester tests override this
         function via Mock to drive Read-LdapEntry through a synthetic
         two-page sequence.
     #>
     [CmdletBinding()]
-    [OutputType([PageResultResponseControl])]
+    [OutputType([System.DirectoryServices.Protocols.PageResultResponseControl])]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNull()]
@@ -205,7 +232,7 @@ function Get-PageResultControl {
     )
 
     foreach ($control in $Response.Controls) {
-        if ($control -is [PageResultResponseControl]) {
+        if ($control -is [System.DirectoryServices.Protocols.PageResultResponseControl]) {
             return $control
         }
     }
@@ -270,7 +297,7 @@ function Invoke-PagedLdapSearch {
         [int] $PageSize = 1000,
 
         [Parameter()]
-        [SearchScope] $Scope = [SearchScope]::Subtree
+        [System.DirectoryServices.Protocols.SearchScope] $Scope = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     )
 
     $results = [List[hashtable]]::new()
@@ -332,7 +359,7 @@ function Get-ADNamingContext {
     [OutputType([List[PSObject]])]
     param(
         [Parameter(Mandatory)]
-        [LdapConnection] $Connection
+        [System.DirectoryServices.Protocols.LdapConnection] $Connection
     )
 
     $rootAttrs = @(
@@ -342,8 +369,11 @@ function Get-ADNamingContext {
         'schemaNamingContext'
         'rootDomainNamingContext'
     )
-    $request  = [SearchRequest]::new('', '(objectClass=*)', [SearchScope]::Base, $rootAttrs)
-    $response = [SearchResponse] $Connection.SendRequest($request)
+    # AddRange pattern instead of constructor-attribute parameter — see
+    # Read-LdapEntry comment / session-changes §3a.
+    $request  = [System.DirectoryServices.Protocols.SearchRequest]::new('', '(objectClass=*)', [System.DirectoryServices.Protocols.SearchScope]::Base, $null)
+    [void] $request.Attributes.AddRange($rootAttrs)
+    $response = [System.DirectoryServices.Protocols.SearchResponse] $Connection.SendRequest($request)
     if ($response.Entries.Count -eq 0) {
         throw 'RootDSE search returned no entries.'
     }

@@ -1,6 +1,8 @@
 #Requires -Version 7.0
 using namespace System.Collections.Generic
-using namespace System.DirectoryServices.Protocols
+
+# SDP types use fully-qualified names — see Phase1-DiscoveryAndMaps.ps1 header
+# and docs/session-changes-2025-05-15.md §1.
 
 <#
 .SYNOPSIS
@@ -73,8 +75,8 @@ function Get-ADObjectAclBatch {
         [int] $PageSize = 1000
     )
 
-    $sdMasks   = [SecurityMasks]::Owner -bor [SecurityMasks]::Dacl
-    $sdControl = [SecurityDescriptorFlagControl]::new($sdMasks)
+    $sdMasks   = [System.DirectoryServices.Protocols.SecurityMasks]::Owner -bor [System.DirectoryServices.Protocols.SecurityMasks]::Dacl
+    $sdControl = [System.DirectoryServices.Protocols.SecurityDescriptorFlagControl]::new($sdMasks)
 
     $searchParams = @{
         Connection         = $Connection
@@ -90,7 +92,7 @@ function Get-ADObjectAclBatch {
         BinaryAttributes   = @('objectGUID', 'nTSecurityDescriptor')
         AdditionalControls = , $sdControl
         PageSize           = $PageSize
-        Scope              = [SearchScope]::Subtree
+        Scope              = [System.DirectoryServices.Protocols.SearchScope]::Subtree
     }
 
     $batch = [List[PSObject]]::new($BatchSize)
