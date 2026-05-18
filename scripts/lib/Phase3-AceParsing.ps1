@@ -634,6 +634,122 @@ function Receive-RunspaceHandle {
     , $results
 }
 
+function Write-AceBatchToStream {
+    <#
+    .SYNOPSIS
+        Append one batch of ACE records to an open StreamWriter using the
+        Phase 3 CLIXML batch format.
+
+    .DESCRIPTION
+        Serialises -Records via [PSSerializer]::Serialize at -Depth 3 (flat
+        PSCustomObjects with primitive properties round-trip exactly) and
+        appends the resulting CLIXML document to -Writer, preceded by the
+        sentinel marker line '<!--===BATCH===-->'. Empty batches are
+        skipped (no marker, no document) so the file format stays valid
+        even when a runspace returns nothing.
+
+        Format choice (ADR-030): CLIXML per batch beats line-per-object
+        JSON for two reasons — (a) round-trips [guid], [byte], [uint32]
+        without re-casting on every read; (b) one Serialize/Deserialize
+        call per ~50-row batch instead of per row keeps the writer cost
+        amortised. Read-AceStream is the matching consumer.
+
+    .PARAMETER Writer
+        Open StreamWriter to which the batch is appended.
+
+    .PARAMETER Records
+        ACE records as emitted by Invoke-AceParsingWorkUnit (any IEnumerable
+        of PSObject). Empty input is a no-op.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Appends to the supplied StreamWriter; the side effect is the documented output.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        [System.IO.StreamWriter] $Writer,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNull()]
+        $Records
+    )
+
+    $count = 0
+    $array = [List[PSObject]]::new()
+    foreach ($r in $Records) {
+        if ($null -eq $r) { continue }
+        $array.Add($r)
+        $count++
+    }
+    if ($count -eq 0) { return }
+
+    $xml = [System.Management.Automation.PSSerializer]::Serialize($array.ToArray(), 3)
+    $Writer.WriteLine('<!--===BATCH===-->')
+    $Writer.WriteLine($xml)
+}
+
+function Read-AceStream {
+    <#
+    .SYNOPSIS
+        Stream ACE records back from a Phase 3 CLIXML batch file written by
+        Write-AceBatchToStream.
+
+    .DESCRIPTION
+        Opens -Path as a forward-only StreamReader, accumulates lines until
+        the next '<!--===BATCH===-->' marker (or EOF), deserialises the
+        batch via [PSSerializer]::Deserialize, and yields each record to
+        the pipeline. The reader holds at most one batch in memory — the
+        per-batch buffer is reused via StringBuilder.Clear().
+
+        Deserialised records are Deserialized.System.Management.Automation.PSCustomObject
+        instances. Property access by name (.ObjectDN, .AceFlagsRaw, etc.)
+        works the same as on the original; primitive types ([guid], [byte],
+        [uint32]) are preserved. Downstream consumers that don't need to
+        mutate the object can treat them as identical to Phase 3 output.
+
+        Missing input file is a clean no-op (returns nothing) — lets the
+        entry script call this unconditionally during Phase 4/5/6 even
+        when Phase 3 produced zero records.
+
+    .PARAMETER Path
+        Absolute path to the Phase 3 CLIXML batch file.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSObject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $reader = [System.IO.StreamReader]::new($Path)
+    $buf = [System.Text.StringBuilder]::new()
+    try {
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            if ($line -eq '<!--===BATCH===-->') {
+                if ($buf.Length -gt 0) {
+                    $items = [System.Management.Automation.PSSerializer]::Deserialize($buf.ToString())
+                    foreach ($item in $items) { $item }
+                    [void] $buf.Clear()
+                }
+                continue
+            }
+            [void] $buf.AppendLine($line)
+        }
+        if ($buf.Length -gt 0) {
+            $items = [System.Management.Automation.PSSerializer]::Deserialize($buf.ToString())
+            foreach ($item in $items) { $item }
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
 function Invoke-RunspacePoolWork {
     <#
     .SYNOPSIS

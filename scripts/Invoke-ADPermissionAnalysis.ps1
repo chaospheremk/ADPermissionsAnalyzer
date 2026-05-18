@@ -285,6 +285,15 @@ $logPath    = Join-Path -Path $resolvedOutput -ChildPath $LogFileName
 $detailPath = Join-Path -Path $resolvedOutput -ChildPath $DetailFileName
 $pivotPath  = Join-Path -Path $resolvedOutput -ChildPath $PivotFileName
 
+# Phase 3 and Phase 5 disk-streamed ACE record files (ADR-030). The Phase 3
+# file holds the raw post-parse records (~30 props); Phase 5's two-pass
+# rewriter consumes it and writes the resolved records (with InheritanceSourceDN
+# / InheritanceSourceNote populated) to the Phase 5 file. Phase 3 file is
+# deleted after Phase 5 completes successfully; Phase 5 file is deleted in
+# the finally block on success and kept on fatal failure for diagnostics.
+$phase3AceRecordsPath = Join-Path -Path $resolvedOutput -ChildPath "Phase3-AceRecords_$timestamp.clixml"
+$phase5AceRecordsPath = Join-Path -Path $resolvedOutput -ChildPath "Phase5-AceRecords_$timestamp.clixml"
+
 # --- Script-scoped state ----------------------------------------------------
 
 $script:LogWriter = [StreamWriter]::new($logPath, $false, [Encoding]::UTF8)
@@ -512,7 +521,14 @@ try {
     }
 
     $handles      = [System.Collections.Generic.List[PSObject]]::new()
-    $aceRecords   = [System.Collections.Generic.List[PSObject]]::new()
+    # Per ADR-030, parsed ACE records are streamed to disk as each runspace
+    # batch completes — the in-memory $aceRecords list has been replaced
+    # with a disk-backed CLIXML batch file. $aceRecordCount tracks the
+    # running total for JSONL events; consumers Phase 4/5/6 stream from
+    # the file instead of holding the records in memory.
+    $script:Phase3Writer = [StreamWriter]::new($phase3AceRecordsPath, $false, [UTF8Encoding]::new($false))
+    $script:Phase3Writer.AutoFlush = $false
+    $aceRecordCount = 0
     $totalBatches = 0
     # Drain completed handles whenever pending count crosses this threshold.
     # Caps live [powershell] pipelines at ~2× the runspace pool size, so
@@ -563,7 +579,10 @@ try {
                     if (-not $h.Handle.IsCompleted) { continue }
                     try {
                         $output = $h.PowerShell.EndInvoke($h.Handle)
-                        foreach ($o in $output) { $aceRecords.Add($o) }
+                        if ($null -ne $output -and $output.Count -gt 0) {
+                            Write-AceBatchToStream -Writer $script:Phase3Writer -Records $output
+                            $aceRecordCount += $output.Count
+                        }
                         if ($h.PowerShell.Streams.Error.Count -gt 0) {
                             foreach ($err in $h.PowerShell.Streams.Error) {
                                 $script:ErrorBag.Add([PSCustomObject]@{
@@ -601,7 +620,7 @@ try {
                         Data      = @{
                             drained       = $drainedThisPass
                             pendingDrains = $handles.Count
-                            acesCollected = $aceRecords.Count
+                            acesCollected = $aceRecordCount
                             memory        = (Get-RuntimeMemorySnapshot)
                         }
                     }
@@ -620,7 +639,7 @@ try {
                         ncObjectCount = $ncObjectCount
                         totalObjects  = $totalObjects
                         pendingDrains = $handles.Count
-                        acesCollected = $aceRecords.Count
+                        acesCollected = $aceRecordCount
                         memory        = (Get-RuntimeMemorySnapshot)
                     }
                 }
@@ -629,7 +648,7 @@ try {
                 $writeProgressParams = @{
                     Activity         = 'AD Permissions Analyzer - Phase 2'
                     Status           = "$($nc.DistinguishedName): $ncObjectCount objects"
-                    CurrentOperation = "Total: $totalObjects | Pending: $($handles.Count) | ACEs: $($aceRecords.Count)"
+                    CurrentOperation = "Total: $totalObjects | Pending: $($handles.Count) | ACEs: $aceRecordCount"
                 }
                 Write-Progress @writeProgressParams
 
@@ -681,17 +700,27 @@ try {
     Write-LogEvent @phase2EndParams
 
     # --- Phase 3 final drain: collect stragglers ---------------------------
-    # The mid-enumeration drain inside the foreach loop already freed
-    # pipelines as they completed and appended their ACE output to
-    # $aceRecords. Any remaining handles here were still in-flight when
-    # enumeration finished; Receive-RunspaceHandle blocks on them and
-    # captures per-handle errors into $script:ErrorBag.
+    # The mid-enumeration drain inside the foreach loop already streamed
+    # completed pipelines' ACE output to the Phase 3 disk file via
+    # Write-AceBatchToStream. Any remaining handles here were still
+    # in-flight when enumeration finished; Receive-RunspaceHandle blocks
+    # on them and captures per-handle errors into $script:ErrorBag.
     $preDrainErrorCount = $script:ErrorBag.Count
     if ($handles.Count -gt 0) {
         $finalDrained = Receive-RunspaceHandle -Handles $handles -ErrorBag $script:ErrorBag
-        foreach ($o in $finalDrained) { $aceRecords.Add($o) }
+        if ($null -ne $finalDrained -and $finalDrained.Count -gt 0) {
+            Write-AceBatchToStream -Writer $script:Phase3Writer -Records $finalDrained
+            $aceRecordCount += $finalDrained.Count
+        }
         $handles.Clear()
     }
+    # Flush + close the Phase 3 writer so Phase 4/5 readers see a complete
+    # file. The script-scoped variable is cleared so the finally block does
+    # not attempt a second dispose.
+    $script:Phase3Writer.Flush()
+    $script:Phase3Writer.Dispose()
+    $script:Phase3Writer = $null
+
     for ($i = $preDrainErrorCount; $i -lt $script:ErrorBag.Count; $i++) {
         $err = $script:ErrorBag[$i]
         $errMeta = $err.Metadata
@@ -716,7 +745,7 @@ try {
         Message   = 'Phase 3 complete.'
         Data      = @{
             totalObjects = $totalObjects
-            totalAces    = $aceRecords.Count
+            totalAces    = $aceRecordCount
             batchCount   = $totalBatches
             elapsedMs    = $phase3ElapsedMs
             memory       = (Get-RuntimeMemorySnapshot)
@@ -744,7 +773,7 @@ try {
     $script:GroupExpansionCache = [Dictionary[string, List[PSObject]]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
 
-    $distinctTrustees = Get-DistinctTrusteeSet -AceRecords $aceRecords
+    $distinctTrustees = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $phase3AceRecordsPath
     $orphanCount      = 0
     $loggedOrphans    = [HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase)
@@ -838,7 +867,11 @@ try {
     }
     Write-LogEvent @phase5StartParams
 
-    $aceIndex = New-AceIndex -AceRecords $aceRecords
+    # Per ADR-030, Phase 5 is now a two-pass streaming consumer of the
+    # Phase 3 CLIXML file. Pass 1 builds a compact (~hundreds of MB even
+    # at the 50k-object ceiling) index over explicit rows only; Pass 2
+    # streams every row and writes resolved records to the Phase 5 file.
+    $aceIndex = New-AceIndexFromStream -Phase3AceRecordsPath $phase3AceRecordsPath
 
     $ncDns = [List[string]]::new()
     foreach ($nc in $namingContexts) {
@@ -847,12 +880,22 @@ try {
 
     $protectedDaclAnomalies = [List[PSObject]]::new()
     $resolveParams = @{
-        AceRecords                      = $aceRecords
+        Phase3AceRecordsPath            = $phase3AceRecordsPath
+        Phase5OutputPath                = $phase5AceRecordsPath
         AceIndex                        = $aceIndex
         NamingContextDistinguishedNames = $ncDns.ToArray()
         ProtectedDaclAnomalies          = $protectedDaclAnomalies
     }
-    $phase5Stats = Resolve-InheritanceSource @resolveParams
+    $phase5Stats = Resolve-InheritanceSourceStream @resolveParams
+
+    # Phase 5 succeeded — the Phase 3 file is no longer needed. Release
+    # the index reference so GC can reclaim the compact bucket memory
+    # before Phase 6's pivot accumulator starts growing. Delete the
+    # Phase 3 file to recover disk space mid-run.
+    $aceIndex = $null
+    if (Test-Path -LiteralPath $phase3AceRecordsPath) {
+        Remove-Item -LiteralPath $phase3AceRecordsPath -Force -ErrorAction SilentlyContinue
+    }
 
     foreach ($anomaly in $protectedDaclAnomalies) {
         $anomalyParams = @{
@@ -929,7 +972,7 @@ try {
 
     $detailParams = @{
         DetailPath          = $detailPath
-        AceRecords          = $aceRecords
+        AceRecordsPath      = $phase5AceRecordsPath
         TrusteeCache        = $script:TrusteeCache
         GroupExpansionCache = $script:GroupExpansionCache
         NamingContexts      = $namingContexts.ToArray()
@@ -1025,12 +1068,35 @@ catch {
     Write-Error -ErrorRecord $_ -ErrorAction Continue
 }
 finally {
+    if ($script:Phase3Writer) {
+        # Writer survived past Phase 3 only if an exception aborted the run
+        # before the Phase 3 final-drain flush+dispose. Best-effort close so
+        # the file is at least readable for diagnosis.
+        try {
+            $script:Phase3Writer.Flush()
+            $script:Phase3Writer.Dispose()
+        }
+        catch { $null = $_ }
+        $script:Phase3Writer = $null
+    }
     if ($script:Phase3Pool) {
         try { $script:Phase3Pool.Close() } catch { $null = $_ }
         $script:Phase3Pool.Dispose()
     }
     if ($script:LdapConnection) {
         $script:LdapConnection.Dispose()
+    }
+    # Per ADR-030: clean up the Phase 3 / Phase 5 disk-streamed ACE record
+    # files on success (exit code 0 or 2). Keep them on fatal failure
+    # (exit code 1) — they are diagnostic-useful when a run dies mid
+    # Phase 5/6.
+    if ($exitCode -ne 1) {
+        if (Test-Path -LiteralPath $phase3AceRecordsPath) {
+            Remove-Item -LiteralPath $phase3AceRecordsPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $phase5AceRecordsPath) {
+            Remove-Item -LiteralPath $phase5AceRecordsPath -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($script:LogWriter) {
         $script:LogWriter.Flush()

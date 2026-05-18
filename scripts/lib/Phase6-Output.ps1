@@ -374,11 +374,17 @@ function Write-DetailCsv {
 
     .DESCRIPTION
         Opens a [StreamWriter] at -DetailPath (UTF-8, no BOM, AutoFlush
-        off — flushes once at end). Writes the header, then for each ACE
-        in -AceRecords expands into one or more (effective trustee, path,
-        IsThroughGroup) tuples via Get-EffectiveTrusteeRecord and writes
-        one row per tuple. Each emitted tuple updates the -PivotStats
-        dictionary so Write-PivotCsv can serialise without a second pass.
+        off — flushes once at end). Writes the header, then streams every
+        ACE record from -AceRecordsPath (Phase 5 CLIXML batch file) via
+        Read-AceStream, expanding each into one or more (effective trustee,
+        path, IsThroughGroup) tuples via Get-EffectiveTrusteeRecord and
+        writing one row per tuple. Each emitted tuple updates the
+        -PivotStats dictionary so Write-PivotCsv can serialise without a
+        second pass.
+
+        Per ADR-030, the ACE record set is no longer materialised in
+        memory — Phase 6 is the streaming consumer of the Phase 5 output
+        file.
 
         -ProgressCallback (optional scriptblock) fires every
         -ProgressInterval rows with the running tuple count + elapsed ms;
@@ -392,10 +398,11 @@ function Write-DetailCsv {
     .PARAMETER DetailPath
         Absolute path to the detail CSV file.
 
-    .PARAMETER AceRecords
-        Phase 3 ACE list, post-Phase 5 mutation
-        (InheritanceSourceDN / InheritanceSourceNote present on every
-        row).
+    .PARAMETER AceRecordsPath
+        Path to the Phase 5 CLIXML batch file produced by
+        Resolve-InheritanceSourceStream — every record carries the full
+        Phase 3 property set plus InheritanceSourceDN /
+        InheritanceSourceNote.
 
     .PARAMETER TrusteeCache
         Phase 4 SID -> resolved trustee dictionary.
@@ -435,8 +442,8 @@ function Write-DetailCsv {
         [string] $DetailPath,
 
         [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [List[PSObject]] $AceRecords,
+        [ValidateNotNullOrEmpty()]
+        [string] $AceRecordsPath,
 
         [Parameter(Mandatory)]
         [ValidateNotNull()]
@@ -498,7 +505,7 @@ function Write-DetailCsv {
         $row = [string[]]::new($script:Phase6DetailColumns.Length)
         $escCollectedAt = New-CsvFieldEscaper -Value $CollectedAt
 
-        foreach ($ace in $AceRecords) {
+        foreach ($ace in (Read-AceStream -Path $AceRecordsPath)) {
             $ncLabelParams = @{
                 ObjectDN             = [string] $ace.ObjectDN
                 SortedNamingContexts = $sortedArray

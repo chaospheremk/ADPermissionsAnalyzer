@@ -4,16 +4,18 @@ using namespace System.Security.AccessControl
 
 <#
 .SYNOPSIS
-    Phase 5 helpers for AD Permissions Analyzer: composite-key index over
-    explicit ACEs + inheritance source resolution with DACL_PROTECTED
-    short-circuit.
+    Phase 5 helpers for AD Permissions Analyzer: streaming composite-key
+    index over explicit ACEs + inheritance source resolution rewriter
+    with DACL_PROTECTED short-circuit.
 
 .DESCRIPTION
-    Implements §9 from docs/AD-Permissions-Analyzer-Plan.md. Pure in-memory
-    transforms over the Phase 3 $aceRecords list — no IO, no LDAP. Phase 5
-    is the FIRST phase that mutates $aceRecords: every row gains
-    InheritanceSourceDN and InheritanceSourceNote columns so the Phase 6
-    detail-CSV schema is uniform across explicit and inherited rows.
+    Implements §9 from docs/AD-Permissions-Analyzer-Plan.md. Per ADR-030,
+    Phase 5 is now a two-pass streaming consumer of the Phase 3 CLIXML
+    batch file: Pass 1 builds a compact in-memory index over explicit
+    rows only (no full-row payload), Pass 2 streams every row and rewrites
+    to a Phase 5 CLIXML file with the two added columns
+    (InheritanceSourceDN, InheritanceSourceNote). The detail-CSV schema
+    is uniform across explicit and inherited rows.
 
     The index keying is plan §9: (ObjectDN, TrusteeSid, AccessMask,
     ObjectTypeGuid). DN strings are normalised to upper-invariant before
@@ -23,7 +25,8 @@ using namespace System.Security.AccessControl
 
     Synthetic.Owner rows (AceIndex = -1) and PARSE_ERROR placeholders
     (AceIndex = -2) are excluded from the index — they are never the
-    source of an inheritance chain.
+    source of an inheritance chain — but they ARE rewritten to the
+    Phase 5 output stream with the two added columns set to defaults.
 
     Inheritance flags are sourced from each ACE's AceFlagsRaw byte
     (Phase 3 composes ContainerInherit / ObjectInherit / NoPropagateInherit
@@ -31,28 +34,41 @@ using namespace System.Security.AccessControl
     each record is the [System.Security.AccessControl.InheritanceFlags]
     enum form — useful for CSV output, but missing the propagation bits we
     need for Phase 5's class-filter rule.
+
+    The index bucket payload is a minimal PSCustomObject with only the
+    two fields Test-InheritanceFlagsPropagateTo decodes (AceFlagsRaw and
+    InheritedObjectTypeName). Dropping the full ~30-property ACE record
+    is what makes the streaming index fit in memory at the 50k-object
+    scale — see ADR-030 for the heap-budget rationale.
 #>
 
-function New-AceIndex {
+function New-AceIndexFromStream {
     <#
     .SYNOPSIS
-        Build the composite-key inheritance index over explicit ACEs only.
+        Pass 1 of Phase 5: build the compact composite-key inheritance
+        index by streaming the Phase 3 CLIXML batch file.
 
     .DESCRIPTION
-        Single-pass over $AceRecords. Skips inherited rows (they're the
-        consumers, not the sources), Synthetic.Owner rows (AceIndex = -1;
-        they are not part of the DACL inheritance graph), and PARSE_ERROR
-        placeholders (AceIndex = -2). Composite-key collisions stack into
-        the same List — Resolve-InheritanceSource scans the list and the
-        first candidate matching Test-InheritanceFlagsPropagateTo wins.
+        Streams -Phase3AceRecordsPath via Read-AceStream. For each
+        explicit row (IsInherited = $false, AceIndex >= 0), inserts a
+        minimal record into the composite-key bucket carrying only the
+        two fields downstream propagation needs: AceFlagsRaw and
+        InheritedObjectTypeName. The full ACE PSObject is NOT retained —
+        the index is the only Phase 5 in-memory artefact and must fit
+        comfortably in the post-ADR-030 heap budget.
+
+        Composite-key collisions stack into the same List —
+        Resolve-InheritanceSourceStream scans the list and the first
+        candidate matching Test-InheritanceFlagsPropagateTo wins.
 
         Returns Dictionary[ValueTuple[string, string, uint32, guid],
         List[PSObject]] keyed by (ObjectDN-upper, TrusteeSid, AccessMask,
-        ObjectTypeGuid).
+        ObjectTypeGuid). Bucket values are PSCustomObjects with
+        AceFlagsRaw + InheritedObjectTypeName only.
 
-    .PARAMETER AceRecords
-        Phase 3 output: every parsed ACE plus synthetic owner rows plus
-        per-object PARSE_ERROR placeholders.
+    .PARAMETER Phase3AceRecordsPath
+        Path to the Phase 3 CLIXML batch file produced by
+        Write-AceBatchToStream.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
@@ -61,13 +77,13 @@ function New-AceIndex {
     [OutputType([Dictionary[ValueTuple[string, string, uint32, guid], List[PSObject]]])]
     param(
         [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [List[PSObject]] $AceRecords
+        [ValidateNotNullOrEmpty()]
+        [string] $Phase3AceRecordsPath
     )
 
     $index = [Dictionary[ValueTuple[string, string, uint32, guid], List[PSObject]]]::new()
 
-    foreach ($ace in $AceRecords) {
+    foreach ($ace in (Read-AceStream -Path $Phase3AceRecordsPath)) {
         if ($ace.IsInherited)    { continue }
         if ($ace.AceIndex -lt 0) { continue }
 
@@ -82,7 +98,10 @@ function New-AceIndex {
             $bucket = [List[PSObject]]::new()
             $index[$key] = $bucket
         }
-        $bucket.Add($ace)
+        $bucket.Add([PSCustomObject]@{
+            AceFlagsRaw             = [byte]   $ace.AceFlagsRaw
+            InheritedObjectTypeName = [string] $ace.InheritedObjectTypeName
+        })
     }
 
     , $index
@@ -264,46 +283,56 @@ function Test-InheritanceFlagsPropagateTo {
     $true
 }
 
-function Resolve-InheritanceSource {
+function Resolve-InheritanceSourceStream {
     <#
     .SYNOPSIS
-        Populate InheritanceSourceDN + InheritanceSourceNote on every
-        record in $AceRecords, mutating in place per plan §9.
+        Pass 2 of Phase 5: stream every Phase 3 ACE record, resolve
+        inheritance source on inherited rows, and write the resolved
+        records to the Phase 5 CLIXML batch file.
 
     .DESCRIPTION
-        Phase 5 entry point. For each row in $AceRecords:
+        Streams -Phase3AceRecordsPath via Read-AceStream. For each row,
+        emits a PSCustomObject carrying every Phase 3 property PLUS the
+        two added columns (InheritanceSourceDN, InheritanceSourceNote).
+        Explicit rows leave both empty per plan §11. Inherited rows are
+        resolved against the compact -AceIndex (built by Pass 1 via
+        New-AceIndexFromStream).
 
-        1. Add the InheritanceSourceDN and InheritanceSourceNote columns
-           if they aren't already present, defaulting to $null and ''
-           respectively. Explicit rows leave both empty per plan §11.
-        2. If the row is not inherited (or is a Synthetic.Owner /
-           PARSE_ERROR placeholder), skip.
-        3. If the parent object's DACL is protected (IsDaclProtected
-           = $true), record the InconsistentProtectedDacl note and emit
-           an anomaly record into -ProtectedDaclAnomalies. Plan §9 calls
-           this an internal-consistency violation: a protected DACL
-           should have NO inherited ACEs.
-        4. Otherwise walk the parent chain of the row's ObjectDN, doing
-           a direct-lookup against $AceIndex at each ancestor. Stop at
+        Per-row resolution rules (plan §9):
+
+        1. If the row is not inherited (or is a Synthetic.Owner /
+           PARSE_ERROR placeholder), emit unchanged + defaults.
+        2. If the parent object's DACL is protected (IsDaclProtected
+           = $true), set InheritanceSourceNote = 'InconsistentProtectedDacl'
+           and emit an anomaly record into -ProtectedDaclAnomalies. Plan
+           §9 calls this an internal-consistency violation: a protected
+           DACL should have NO inherited ACEs.
+        3. Otherwise walk the parent chain of the row's ObjectDN, doing
+           a direct-lookup against -AceIndex at each ancestor. Stop at
            the first candidate that passes
-           Test-InheritanceFlagsPropagateTo — by construction this is the
-           NEAREST matching ancestor. Stop walking when we leave every
-           enumerated NC.
-        5. If no ancestor matches, record SchemaDefaultOrUnresolved.
+           Test-InheritanceFlagsPropagateTo — by construction this is
+           the NEAREST matching ancestor. Stop walking when we leave
+           every enumerated NC.
+        4. If no ancestor matches, set InheritanceSourceNote =
+           'SchemaDefaultOrUnresolved'.
 
-        Returns a stats record with counts the entry script writes into
-        the PhaseEnd JSONL event. Anomalies are emitted into the supplied
-        -ProtectedDaclAnomalies list (the entry script forwards them as
-        BatchError events).
+        Records are buffered into batches of -OutputBatchSize rows and
+        emitted to disk via Write-AceBatchToStream so the writer cost is
+        amortised across the run. Returns a stats record with counts the
+        entry script writes into the PhaseEnd JSONL event.
 
-    .PARAMETER AceRecords
-        Phase 3 ACE list. Mutated in place — the schema gains
-        InheritanceSourceDN and InheritanceSourceNote columns on every
-        row.
+    .PARAMETER Phase3AceRecordsPath
+        Path to the Phase 3 CLIXML batch file produced by
+        Write-AceBatchToStream.
+
+    .PARAMETER Phase5OutputPath
+        Path to the Phase 5 CLIXML batch file this function writes.
+        Overwritten on each invocation.
 
     .PARAMETER AceIndex
-        Output of New-AceIndex. Composite-key dictionary over explicit
-        rows only.
+        Output of New-AceIndexFromStream. Composite-key dictionary over
+        explicit rows only; values are minimal records with AceFlagsRaw
+        + InheritedObjectTypeName.
 
     .PARAMETER NamingContextDistinguishedNames
         DN strings for every NC the run enumerated (Phase 1 output).
@@ -313,16 +342,25 @@ function Resolve-InheritanceSource {
         Optional sink for plan §9 'InheritedAceOnProtectedDacl' anomaly
         records. The entry script forwards each into Write-LogEvent at
         WARN level matching the BatchError shape from Phase 3.
+
+    .PARAMETER OutputBatchSize
+        Number of resolved records per CLIXML batch on the Phase 5
+        output file. Default 500 — keeps the per-batch serialization
+        cost amortised without blowing up the in-memory buffer.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
-        Justification = 'Mutates $AceRecords in place (plan §9 contract); does not write to disk or external state.')]
+        Justification = 'Writes one CLIXML batch file as documented; mutates the supplied -ProtectedDaclAnomalies sink only.')]
     [CmdletBinding()]
     [OutputType([PSObject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateNotNull()]
-        [List[PSObject]] $AceRecords,
+        [ValidateNotNullOrEmpty()]
+        [string] $Phase3AceRecordsPath,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Phase5OutputPath,
 
         [Parameter(Mandatory)]
         [ValidateNotNull()]
@@ -333,7 +371,11 @@ function Resolve-InheritanceSource {
         [string[]] $NamingContextDistinguishedNames,
 
         [Parameter()]
-        [List[PSObject]] $ProtectedDaclAnomalies
+        [List[PSObject]] $ProtectedDaclAnomalies,
+
+        [Parameter()]
+        [ValidateRange(1, 10000)]
+        [int] $OutputBatchSize = 500
     )
 
     $ncRoots = [List[string]]::new()
@@ -348,97 +390,133 @@ function Resolve-InheritanceSource {
     $unresolved     = 0
     $protectedDacl  = 0
 
-    foreach ($ace in $AceRecords) {
-        if (-not $ace.PSObject.Properties['InheritanceSourceDN']) {
-            $ace | Add-Member -NotePropertyName 'InheritanceSourceDN' -NotePropertyValue $null
-        }
-        if (-not $ace.PSObject.Properties['InheritanceSourceNote']) {
-            $ace | Add-Member -NotePropertyName 'InheritanceSourceNote' -NotePropertyValue ''
-        }
+    $writer = [System.IO.StreamWriter]::new($Phase5OutputPath, $false, [System.Text.UTF8Encoding]::new($false))
+    $writer.AutoFlush = $false
+    $outputBuffer = [List[PSObject]]::new($OutputBatchSize)
 
-        if (-not $ace.IsInherited) { continue }
-        if ($ace.AceIndex -lt 0)   { continue }
+    try {
+        foreach ($ace in (Read-AceStream -Path $Phase3AceRecordsPath)) {
+            $sourceDn   = $null
+            $sourceNote = ''
 
-        $inheritedTotal++
+            if ($ace.IsInherited -and $ace.AceIndex -ge 0) {
+                $inheritedTotal++
 
-        if ($ace.IsDaclProtected) {
-            $ace.InheritanceSourceDN   = $null
-            $ace.InheritanceSourceNote = 'InconsistentProtectedDacl'
-            $protectedDacl++
+                if ($ace.IsDaclProtected) {
+                    $sourceNote    = 'InconsistentProtectedDacl'
+                    $protectedDacl++
 
-            if ($null -ne $ProtectedDaclAnomalies) {
-                $ProtectedDaclAnomalies.Add([PSCustomObject]@{
-                    Event      = 'InheritedAceOnProtectedDacl'
-                    ObjectDN   = $ace.ObjectDN
-                    TrusteeSid = $ace.TrusteeSid
-                    AccessMask = $ace.AccessMask
-                    AceIndex   = $ace.AceIndex
-                })
-            }
-            continue
-        }
-
-        $parent         = Get-ParentDistinguishedName -DistinguishedName $ace.ObjectDN
-        $level          = 1
-        $found          = $false
-        $objectTypeGuid = [guid] $ace.ObjectTypeGuid
-        $accessMask     = [uint32] $ace.AccessMask
-        $trusteeSid     = [string] $ace.TrusteeSid
-        $descendantClass = [string] $ace.ObjectClass
-
-        while ($parent) {
-            $parentUpper  = $parent.ToUpperInvariant()
-            $withinAnyNc  = $false
-            $isAtNcRoot   = $false
-            foreach ($root in $ncRoots) {
-                if ($parentUpper -eq $root) {
-                    $withinAnyNc = $true
-                    $isAtNcRoot  = $true
-                    break
-                }
-                if ($parentUpper.EndsWith(",$root")) {
-                    $withinAnyNc = $true
-                    break
-                }
-            }
-            if (-not $withinAnyNc) { break }
-
-            $key = [ValueTuple[string, string, uint32, guid]]::new(
-                $parentUpper, $trusteeSid, $accessMask, $objectTypeGuid)
-
-            $candidates = $null
-            if ($AceIndex.TryGetValue($key, [ref] $candidates)) {
-                foreach ($candidate in $candidates) {
-                    $checkParams = @{
-                        AceFlagsRaw             = [byte] $candidate.AceFlagsRaw
-                        InheritedObjectTypeName = [string] $candidate.InheritedObjectTypeName
-                        DescendantClass         = $descendantClass
-                        IsDirectChild           = ($level -eq 1)
-                    }
-                    if (Test-InheritanceFlagsPropagateTo @checkParams) {
-                        $ace.InheritanceSourceDN   = $parent
-                        $ace.InheritanceSourceNote = ''
-                        $found = $true
-                        break
+                    if ($null -ne $ProtectedDaclAnomalies) {
+                        $ProtectedDaclAnomalies.Add([PSCustomObject]@{
+                            Event      = 'InheritedAceOnProtectedDacl'
+                            ObjectDN   = $ace.ObjectDN
+                            TrusteeSid = $ace.TrusteeSid
+                            AccessMask = $ace.AccessMask
+                            AceIndex   = $ace.AceIndex
+                        })
                     }
                 }
+                else {
+                    $parent         = Get-ParentDistinguishedName -DistinguishedName $ace.ObjectDN
+                    $level          = 1
+                    $found          = $false
+                    $objectTypeGuid = [guid] $ace.ObjectTypeGuid
+                    $accessMask     = [uint32] $ace.AccessMask
+                    $trusteeSid     = [string] $ace.TrusteeSid
+                    $descendantClass = [string] $ace.ObjectClass
+
+                    while ($parent) {
+                        $parentUpper = $parent.ToUpperInvariant()
+                        $withinAnyNc = $false
+                        $isAtNcRoot  = $false
+                        foreach ($root in $ncRoots) {
+                            if ($parentUpper -eq $root) {
+                                $withinAnyNc = $true
+                                $isAtNcRoot  = $true
+                                break
+                            }
+                            if ($parentUpper.EndsWith(",$root")) {
+                                $withinAnyNc = $true
+                                break
+                            }
+                        }
+                        if (-not $withinAnyNc) { break }
+
+                        $key = [ValueTuple[string, string, uint32, guid]]::new(
+                            $parentUpper, $trusteeSid, $accessMask, $objectTypeGuid)
+
+                        $candidates = $null
+                        if ($AceIndex.TryGetValue($key, [ref] $candidates)) {
+                            foreach ($candidate in $candidates) {
+                                $checkParams = @{
+                                    AceFlagsRaw             = [byte] $candidate.AceFlagsRaw
+                                    InheritedObjectTypeName = [string] $candidate.InheritedObjectTypeName
+                                    DescendantClass         = $descendantClass
+                                    IsDirectChild           = ($level -eq 1)
+                                }
+                                if (Test-InheritanceFlagsPropagateTo @checkParams) {
+                                    $sourceDn = $parent
+                                    $found    = $true
+                                    break
+                                }
+                            }
+                        }
+
+                        if ($found)      { break }
+                        if ($isAtNcRoot) { break }
+
+                        $parent = Get-ParentDistinguishedName -DistinguishedName $parent
+                        $level++
+                    }
+
+                    if ($found) {
+                        $resolved++
+                    }
+                    else {
+                        $sourceNote = 'SchemaDefaultOrUnresolved'
+                        $unresolved++
+                    }
+                }
             }
 
-            if ($found)      { break }
-            if ($isAtNcRoot) { break }
+            $outputBuffer.Add([PSCustomObject]@{
+                ObjectDN                = [string] $ace.ObjectDN
+                ObjectClass             = [string] $ace.ObjectClass
+                ObjectGUID              = [guid]   $ace.ObjectGUID
+                TrusteeSid              = [string] $ace.TrusteeSid
+                AccessMask              = [uint32] $ace.AccessMask
+                AccessControlType       = [string] $ace.AccessControlType
+                AceType                 = [string] $ace.AceType
+                RightsDecoded           = [string] $ace.RightsDecoded
+                ObjectTypeGuid          = [guid]   $ace.ObjectTypeGuid
+                ObjectTypeName          = [string] $ace.ObjectTypeName
+                ObjectTypeKind          = [string] $ace.ObjectTypeKind
+                InheritedObjectTypeGuid = [guid]   $ace.InheritedObjectTypeGuid
+                InheritedObjectTypeName = [string] $ace.InheritedObjectTypeName
+                InheritanceFlags        = [string] $ace.InheritanceFlags
+                IsInherited             = [bool]   $ace.IsInherited
+                IsDaclProtected         = [bool]   $ace.IsDaclProtected
+                AceIndex                = [int]    $ace.AceIndex
+                AceFlagsRaw             = [byte]   $ace.AceFlagsRaw
+                InheritanceSourceDN     = $sourceDn
+                InheritanceSourceNote   = $sourceNote
+            })
 
-            $parent = Get-ParentDistinguishedName -DistinguishedName $parent
-            $level++
+            if ($outputBuffer.Count -ge $OutputBatchSize) {
+                Write-AceBatchToStream -Writer $writer -Records $outputBuffer
+                $outputBuffer.Clear()
+            }
         }
 
-        if ($found) {
-            $resolved++
+        if ($outputBuffer.Count -gt 0) {
+            Write-AceBatchToStream -Writer $writer -Records $outputBuffer
+            $outputBuffer.Clear()
         }
-        else {
-            $ace.InheritanceSourceDN   = $null
-            $ace.InheritanceSourceNote = 'SchemaDefaultOrUnresolved'
-            $unresolved++
-        }
+
+        $writer.Flush()
+    }
+    finally {
+        $writer.Dispose()
     }
 
     [PSCustomObject]@{

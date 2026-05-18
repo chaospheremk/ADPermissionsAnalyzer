@@ -6,7 +6,37 @@ using namespace System.IO
 
 BeforeAll {
     $script:LibDir = Join-Path $PSScriptRoot '../scripts/lib'
+    # Phase 6's Write-DetailCsv streams records from disk via Read-AceStream
+    # (defined in Phase3-AceParsing.ps1) — dot-source both libs.
+    . (Join-Path $script:LibDir 'Phase3-AceParsing.ps1')
     . (Join-Path $script:LibDir 'Phase6-Output.ps1')
+
+    function Write-AceFixtureFile {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)] [string] $Path,
+            [Parameter(Mandatory)] [List[PSObject]] $Records,
+            [Parameter()] [int] $BatchSize = 50
+        )
+        $writer = [System.IO.StreamWriter]::new($Path, $false, [System.Text.UTF8Encoding]::new($false))
+        try {
+            $buf = [List[PSObject]]::new($BatchSize)
+            foreach ($r in $Records) {
+                $buf.Add($r)
+                if ($buf.Count -ge $BatchSize) {
+                    Write-AceBatchToStream -Writer $writer -Records $buf
+                    $buf.Clear()
+                }
+            }
+            if ($buf.Count -gt 0) {
+                Write-AceBatchToStream -Writer $writer -Records $buf
+            }
+            $writer.Flush()
+        }
+        finally {
+            $writer.Dispose()
+        }
+    }
 
     function New-AceRecord {
         param(
@@ -144,11 +174,14 @@ Describe 'Write-DetailCsv row shape' {
             $records = [List[PSObject]]::new()
             $records.Add($Ace)
 
-            $tempPath = [System.IO.Path]::GetTempFileName()
+            $tempPath  = [System.IO.Path]::GetTempFileName()
+            $inputPath = "$tempPath.input.clixml"
             try {
+                Write-AceFixtureFile -Path $inputPath -Records $records
+
                 $writeParams = @{
                     DetailPath          = $tempPath
-                    AceRecords          = $records
+                    AceRecordsPath      = $inputPath
                     TrusteeCache        = $harness.TrusteeCache
                     GroupExpansionCache = $harness.GroupExpansionCache
                     NamingContexts      = $script:NamingContexts
@@ -164,7 +197,8 @@ Describe 'Write-DetailCsv row shape' {
                 }
             }
             finally {
-                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $tempPath  -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $inputPath -Force -ErrorAction SilentlyContinue
             }
         }
     }
@@ -372,11 +406,13 @@ Describe 'Write-DetailCsv' {
             -AceIndex 1) )
 
         $detailPath = Join-Path $script:WorkDir 'detail.csv'
+        $inputPath  = Join-Path $script:WorkDir 'detail.input.clixml'
+        Write-AceFixtureFile -Path $inputPath -Records $records
         $stats      = [Dictionary[string, PSObject]]::new()
 
         $writeParams = @{
             DetailPath          = $detailPath
-            AceRecords          = $records
+            AceRecordsPath      = $inputPath
             TrusteeCache        = $cache
             GroupExpansionCache = $expansion
             NamingContexts      = $script:NamingContexts
@@ -423,11 +459,13 @@ Describe 'Write-DetailCsv' {
         $records.Add( (New-AceRecord -TrusteeSid $script:GroupSid -RightsDecoded 'GenericAll' -AceIndex 0) )
 
         $detailPath = Join-Path $script:WorkDir 'detail-stats.csv'
+        $inputPath  = Join-Path $script:WorkDir 'detail-stats.input.clixml'
+        Write-AceFixtureFile -Path $inputPath -Records $records
         $stats      = [Dictionary[string, PSObject]]::new()
 
         $writeParams = @{
             DetailPath          = $detailPath
-            AceRecords          = $records
+            AceRecordsPath      = $inputPath
             TrusteeCache        = $cache
             GroupExpansionCache = $expansion
             NamingContexts      = $script:NamingContexts
@@ -493,11 +531,13 @@ Describe 'Write-DetailCsv ProgressCallback' {
         $callback = { param([hashtable] $Data) $script:ProgressCalls.Add($Data) }
 
         $detailPath = Join-Path $script:ProgressWorkDir 'detail-progress.csv'
+        $inputPath  = Join-Path $script:ProgressWorkDir 'detail-progress.input.clixml'
+        Write-AceFixtureFile -Path $inputPath -Records $records
         $stats      = [Dictionary[string, PSObject]]::new()
 
         $writeParams = @{
             DetailPath          = $detailPath
-            AceRecords          = $records
+            AceRecordsPath      = $inputPath
             TrusteeCache        = $cache
             GroupExpansionCache = $expansion
             NamingContexts      = $script:NamingContexts
@@ -866,12 +906,14 @@ Describe 'Write-PivotCsv' {
         $records.Add( (New-AceRecord -TrusteeSid $script:GroupSid -RightsDecoded 'GenericAll') )
 
         $detailPath = Join-Path $script:PivotWorkDir 'detail-recon.csv'
+        $inputPath  = Join-Path $script:PivotWorkDir 'detail-recon.input.clixml'
         $pivotPath  = Join-Path $script:PivotWorkDir 'pivot-recon.csv'
+        Write-AceFixtureFile -Path $inputPath -Records $records
         $stats      = [Dictionary[string, PSObject]]::new()
 
         $writeDetailParams = @{
             DetailPath          = $detailPath
-            AceRecords          = $records
+            AceRecordsPath      = $inputPath
             TrusteeCache        = $cache
             GroupExpansionCache = $expansion
             NamingContexts      = $script:NamingContexts
