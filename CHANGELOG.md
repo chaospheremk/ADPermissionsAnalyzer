@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-phase memory instrumentation** (`scripts/Invoke-ADPermissionAnalysis.ps1`, ADR-029). New `Get-RuntimeMemorySnapshot` helper returns `managedHeapMB`, `workingSetMB`, `privateBytesMB` (1dp MB), plus `gen0Collections`, `gen1Collections`, `gen2Collections`. Embedded in the `data.memory` field of every `PhaseStart`/`PhaseEnd` event (Phases 1–6, 12 boundaries), every Phase 2 `EnumerationProgress` event, and new `MidEnumerationDrain` events emitted on productive drain passes (≥1 handle freed). Uses `GC.GetTotalMemory($false)` — no forced collection, no behaviour change. Produces a runtime memory time-series in the JSONL log so the next live run against the work-computer 30k-object domain (which hit an 8+ GB working-set ceiling even after the Phase A drain/Item-pinning fixes) can be diagnosed rather than speculate-fixed.
+
 ### Fixed
 
 - **PS 7.5.4 lazy-compile SDP type resolution** (`scripts/lib/Phase{1,2,4}-*.ps1`, `scripts/Invoke-ADPermissionAnalysis.ps1`). On PS 7.5.x dot-sourced function bodies are compiled lazily at first invocation; by then the parent file's `using namespace System.DirectoryServices.Protocols` directive's scope has been lost and short SDP type names (`SearchRequest`, `LdapConnection`, `AuthType`, `SearchScope`, `SecurityMasks`, `SecurityDescriptorFlagControl`, etc.) fail with `TypeNotFound`. Replaced every `[ShortName]` SDP type reference with `[System.DirectoryServices.Protocols.ShortName]` (18 sites across Phase 1/2/4 lib files plus 3 sites in the entry script body) and dropped the `using namespace System.DirectoryServices.Protocols` directive from those files. Non-SDP namespaces (`System.Collections.Generic`, `System.Security.Principal`, `System.Text`, `System.IO`) keep their `using namespace` directives.

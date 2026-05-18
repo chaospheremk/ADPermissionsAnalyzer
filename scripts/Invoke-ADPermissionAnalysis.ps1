@@ -241,6 +241,33 @@ function Write-LogEvent {
     $script:LogWriter.WriteLine($line)
 }
 
+function Get-RuntimeMemorySnapshot {
+    <#
+    .SYNOPSIS
+        Capture a point-in-time runtime memory snapshot for JSONL telemetry.
+
+    .DESCRIPTION
+        Returns a hashtable with managed heap size, process working set, process
+        private bytes (all in MB, rounded to one decimal), plus generational GC
+        collection counts. Uses GC.GetTotalMemory($false) so no GC pass is
+        forced. Designed to be embedded in a log event's data block at phase
+        boundaries and progress ticks; see ADR-029.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $proc = [System.Diagnostics.Process]::GetCurrentProcess()
+    @{
+        managedHeapMB   = [Math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 1)
+        workingSetMB    = [Math]::Round($proc.WorkingSet64 / 1MB, 1)
+        privateBytesMB  = [Math]::Round($proc.PrivateMemorySize64 / 1MB, 1)
+        gen0Collections = [System.GC]::CollectionCount(0)
+        gen1Collections = [System.GC]::CollectionCount(1)
+        gen2Collections = [System.GC]::CollectionCount(2)
+    }
+}
+
 # --- Defaults requiring runtime evaluation ----------------------------------
 
 $timestamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
@@ -298,6 +325,7 @@ try {
         Phase     = 'Phase1'
         EventName = 'PhaseStart'
         Message   = 'Phase 1: discovery + GUID maps.'
+        Data      = @{ memory = (Get-RuntimeMemorySnapshot) }
     }
     Write-LogEvent @phase1StartParams
 
@@ -372,7 +400,10 @@ try {
         Phase     = 'Phase1'
         EventName = 'PhaseEnd'
         Message   = 'Phase 1 complete.'
-        Data      = @{ elapsedMs = $phase1ElapsedMs }
+        Data      = @{
+            elapsedMs = $phase1ElapsedMs
+            memory    = (Get-RuntimeMemorySnapshot)
+        }
     }
     Write-LogEvent @phase1EndParams
 
@@ -421,6 +452,7 @@ try {
         Phase     = 'Phase2'
         EventName = 'PhaseStart'
         Message   = 'Phase 2: object enumeration.'
+        Data      = @{ memory = (Get-RuntimeMemorySnapshot) }
     }
     Write-LogEvent @phase2StartParams
 
@@ -452,7 +484,10 @@ try {
         Phase     = 'Phase3'
         EventName = 'PhaseStart'
         Message   = 'Phase 3: ACE parsing (runspace pool dispatch).'
-        Data      = @{ threadCount = $ThreadCount }
+        Data      = @{
+            threadCount = $ThreadCount
+            memory      = (Get-RuntimeMemorySnapshot)
+        }
     }
     Write-LogEvent @phase3StartParams
 
@@ -522,6 +557,7 @@ try {
             # append parsed ACEs to $aceRecords, capture per-handle errors
             # into $script:ErrorBag, and Dispose the PowerShell pipeline.
             if ($handles.Count -ge $drainThreshold) {
+                $drainedThisPass = 0
                 for ($di = $handles.Count - 1; $di -ge 0; $di--) {
                     $h = $handles[$di]
                     if (-not $h.Handle.IsCompleted) { continue }
@@ -551,6 +587,25 @@ try {
                         $h.PowerShell.Dispose()
                     }
                     $handles.RemoveAt($di)
+                    $drainedThisPass++
+                }
+                if ($drainedThisPass -gt 0) {
+                    # Memory snapshot on a productive drain lets us correlate
+                    # drain events with managed-heap / working-set movement
+                    # in post-run analysis. ADR-029.
+                    $drainParams = @{
+                        Level     = 'INFO'
+                        Phase     = 'Phase2'
+                        EventName = 'MidEnumerationDrain'
+                        Message   = "Drained $drainedThisPass completed handles."
+                        Data      = @{
+                            drained       = $drainedThisPass
+                            pendingDrains = $handles.Count
+                            acesCollected = $aceRecords.Count
+                            memory        = (Get-RuntimeMemorySnapshot)
+                        }
+                    }
+                    Write-LogEvent @drainParams
                 }
             }
 
@@ -566,6 +621,7 @@ try {
                         totalObjects  = $totalObjects
                         pendingDrains = $handles.Count
                         acesCollected = $aceRecords.Count
+                        memory        = (Get-RuntimeMemorySnapshot)
                     }
                 }
                 Write-LogEvent @progressParams
@@ -619,6 +675,7 @@ try {
             totalObjects             = $totalObjects
             namingContextsEnumerated = $selectedNcs.Count
             elapsedMs                = $phase2ElapsedMs
+            memory                   = (Get-RuntimeMemorySnapshot)
         }
     }
     Write-LogEvent @phase2EndParams
@@ -662,6 +719,7 @@ try {
             totalAces    = $aceRecords.Count
             batchCount   = $totalBatches
             elapsedMs    = $phase3ElapsedMs
+            memory       = (Get-RuntimeMemorySnapshot)
         }
     }
     Write-LogEvent @phase3EndParams
@@ -673,6 +731,7 @@ try {
         Phase     = 'Phase4'
         EventName = 'PhaseStart'
         Message   = 'Phase 4: trustee resolution + group expansion.'
+        Data      = @{ memory = (Get-RuntimeMemorySnapshot) }
     }
     Write-LogEvent @phase4StartParams
 
@@ -763,6 +822,7 @@ try {
             expansionCacheHitRatio = $hitRatio
             skipTransitiveExpansion = [bool] $SkipTransitiveExpansion
             elapsedMs              = $phase4ElapsedMs
+            memory                 = (Get-RuntimeMemorySnapshot)
         }
     }
     Write-LogEvent @phase4EndParams
@@ -774,6 +834,7 @@ try {
         Phase     = 'Phase5'
         EventName = 'PhaseStart'
         Message   = 'Phase 5: inheritance source resolution.'
+        Data      = @{ memory = (Get-RuntimeMemorySnapshot) }
     }
     Write-LogEvent @phase5StartParams
 
@@ -824,6 +885,7 @@ try {
             unresolved      = $phase5Stats.Unresolved
             protectedDacl   = $phase5Stats.ProtectedDacl
             elapsedMs       = $phase5ElapsedMs
+            memory          = (Get-RuntimeMemorySnapshot)
         }
     }
     Write-LogEvent @phase5EndParams
@@ -835,7 +897,10 @@ try {
         Phase     = 'Phase6'
         EventName = 'PhaseStart'
         Message   = 'Phase 6: detail CSV streaming + pivot accumulator.'
-        Data      = @{ detailPath = $detailPath }
+        Data      = @{
+            detailPath = $detailPath
+            memory     = (Get-RuntimeMemorySnapshot)
+        }
     }
     Write-LogEvent @phase6StartParams
 
@@ -887,6 +952,7 @@ try {
             detailRowCount    = $detailRowCount
             distinctTrustees  = $script:PivotStats.Count
             elapsedMs         = $phase6ElapsedMs
+            memory            = (Get-RuntimeMemorySnapshot)
         }
     }
     Write-LogEvent @phase6EndParams
