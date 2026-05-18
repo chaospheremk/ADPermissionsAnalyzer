@@ -206,7 +206,10 @@ function ConvertFrom-AdAce {
 
     $rights         = $Rule.ActiveDirectoryRights
     $rightsDecoded  = $rights.ToString()
-    $accessMask     = [uint32] [int] $rights
+    # Mask via Int64 to preserve the unsigned 32-bit bit pattern: an AD ACE
+    # can carry an AccessMask whose Int32 representation is negative
+    # (e.g. 0xFFFFFFFF -> -1), which the naïve [uint32] cast rejects.
+    $accessMask     = [uint32] (([long] [int] $rights) -band 0xFFFFFFFFL)
 
     $objectTypeGuid = $Rule.ObjectType
     $inheritedGuid  = $Rule.InheritedObjectType
