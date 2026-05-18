@@ -357,6 +357,31 @@ Describe 'ConvertFrom-AdAce' {
 
         $row.IsDaclProtected | Should -BeTrue
     }
+
+    It 'decodes an ACE whose AccessMask is 0xFFFFFFFF without throwing (BUG-002)' {
+        # An AD DACL can carry an ACE whose 32-bit AccessMask is 0xFFFFFFFF
+        # (every bit set). Cast to Int32 this is -1, and the original
+        # `[uint32] [int] $rights` cast threw the BUG-002 message verbatim:
+        # "Cannot convert value \"-1\" to type \"System.UInt32\". ..."
+        # PowerShell's `[ActiveDirectoryRights] -1` coercion refuses
+        # out-of-enum values, so the failing mask is forged via reflection.
+        $rights = [Enum]::ToObject([ActiveDirectoryRights], -1)
+        $ctorTypes = [Type[]] @(
+            [IdentityReference],
+            [ActiveDirectoryRights],
+            [AccessControlType]
+        )
+        $ctor = [ActiveDirectoryAccessRule].GetConstructor($ctorTypes)
+        $rule = $ctor.Invoke(@(
+            [SecurityIdentifier]::new('S-1-5-21-1-2-3-1001'),
+            $rights,
+            [AccessControlType]::Allow))
+
+        $row = Invoke-Decode -Rule $rule
+
+        $row.AccessMask | Should -Be ([uint32]::MaxValue)
+        $row.AccessMask | Should -BeOfType ([uint32])
+    }
 }
 
 Describe 'Invoke-AceParsingWorkUnit' {
