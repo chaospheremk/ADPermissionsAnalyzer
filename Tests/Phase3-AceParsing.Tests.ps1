@@ -577,3 +577,134 @@ Describe 'New-RunspacePool / Invoke-RunspacePoolWork' {
         }
     }
 }
+
+Describe 'Write-AceBatchToStream / Read-AceStream round-trip' {
+    BeforeAll {
+        $script:StreamWorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("phase3-stream-{0}" -f ([guid]::NewGuid()))
+        New-Item -ItemType Directory -Path $script:StreamWorkDir -Force | Out-Null
+
+        function New-StreamingFixtureFile {
+            param(
+                [Parameter(Mandatory)] [string] $Path,
+                [Parameter(Mandatory)] [System.Collections.IEnumerable] $Batches
+            )
+            $writer = [System.IO.StreamWriter]::new($Path, $false, [System.Text.UTF8Encoding]::new($false))
+            try {
+                foreach ($b in $Batches) {
+                    Write-AceBatchToStream -Writer $writer -Records $b
+                }
+                $writer.Flush()
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+
+        function New-SampleAceRecord {
+            param(
+                [Parameter(Mandatory)] [string] $ObjectDN,
+                [Parameter(Mandatory)] [string] $TrusteeSid,
+                [Parameter()] [uint32] $AccessMask = 0x20020,
+                [Parameter()] [byte]   $AceFlagsRaw = 0,
+                [Parameter()] [int]    $AceIndex = 0,
+                [Parameter()] [bool]   $IsInherited = $false
+            )
+            [PSCustomObject]@{
+                ObjectDN                = $ObjectDN
+                ObjectClass             = 'user'
+                ObjectGUID              = [guid]::NewGuid()
+                TrusteeSid              = $TrusteeSid
+                AccessMask              = $AccessMask
+                AccessControlType       = 'Allow'
+                AceType                 = 'AccessAllowed'
+                RightsDecoded           = 'ReadProperty, WriteProperty'
+                ObjectTypeGuid          = [guid]::Empty
+                ObjectTypeName          = ''
+                ObjectTypeKind          = 'All'
+                InheritedObjectTypeGuid = [guid]::Empty
+                InheritedObjectTypeName = ''
+                InheritanceFlags        = 'None'
+                IsInherited             = $IsInherited
+                IsDaclProtected         = $false
+                AceIndex                = $AceIndex
+                AceFlagsRaw             = $AceFlagsRaw
+            }
+        }
+    }
+
+    AfterAll {
+        if (Test-Path -LiteralPath $script:StreamWorkDir) {
+            Remove-Item -LiteralPath $script:StreamWorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'round-trips a single batch with all primitive types intact' {
+        $records = [List[PSObject]]::new()
+        $records.Add( (New-SampleAceRecord -ObjectDN 'CN=u1,DC=lab,DC=local' `
+            -TrusteeSid 'S-1-5-21-100-200-300-1001' -AccessMask 0xF01FF `
+            -AceFlagsRaw 0x12 -AceIndex 3) )
+
+        $path = Join-Path $script:StreamWorkDir ("rt1-{0}.clixml" -f ([guid]::NewGuid()))
+        New-StreamingFixtureFile -Path $path -Batches @(, $records)
+
+        $read = [List[PSObject]]::new()
+        foreach ($r in (Read-AceStream -Path $path)) { $read.Add($r) }
+
+        $read.Count                 | Should -Be 1
+        $read[0].ObjectDN           | Should -Be 'CN=u1,DC=lab,DC=local'
+        $read[0].TrusteeSid         | Should -Be 'S-1-5-21-100-200-300-1001'
+        $read[0].AccessMask         | Should -Be 0xF01FF
+        $read[0].AceFlagsRaw        | Should -Be 0x12
+        $read[0].AceIndex           | Should -Be 3
+        # Type preservation matters — Phase 5's compact-index key uses
+        # [uint32] / [guid] / [byte] equality semantics.
+        $read[0].AccessMask         | Should -BeOfType ([uint32])
+        $read[0].AceFlagsRaw        | Should -BeOfType ([byte])
+        $read[0].ObjectTypeGuid     | Should -BeOfType ([guid])
+        $read[0].IsInherited        | Should -BeOfType ([bool])
+    }
+
+    It 'yields every record across multiple batches in order' {
+        $batch1 = [List[PSObject]]::new()
+        $batch1.Add( (New-SampleAceRecord -ObjectDN 'CN=u1,DC=lab,DC=local' -TrusteeSid 'S-1-5-21-100-200-300-1001') )
+        $batch1.Add( (New-SampleAceRecord -ObjectDN 'CN=u2,DC=lab,DC=local' -TrusteeSid 'S-1-5-21-100-200-300-1002') )
+
+        $batch2 = [List[PSObject]]::new()
+        $batch2.Add( (New-SampleAceRecord -ObjectDN 'CN=u3,DC=lab,DC=local' -TrusteeSid 'S-1-5-21-100-200-300-1003') )
+
+        $batch3 = [List[PSObject]]::new()
+        $batch3.Add( (New-SampleAceRecord -ObjectDN 'CN=u4,DC=lab,DC=local' -TrusteeSid 'S-1-5-21-100-200-300-1004') )
+        $batch3.Add( (New-SampleAceRecord -ObjectDN 'CN=u5,DC=lab,DC=local' -TrusteeSid 'S-1-5-21-100-200-300-1005') )
+
+        $path = Join-Path $script:StreamWorkDir ("rt-multi-{0}.clixml" -f ([guid]::NewGuid()))
+        New-StreamingFixtureFile -Path $path -Batches @($batch1, $batch2, $batch3)
+
+        $dns = [List[string]]::new()
+        foreach ($r in (Read-AceStream -Path $path)) { $dns.Add($r.ObjectDN) }
+
+        $dns.Count | Should -Be 5
+        ($dns -join ',') | Should -Be 'CN=u1,DC=lab,DC=local,CN=u2,DC=lab,DC=local,CN=u3,DC=lab,DC=local,CN=u4,DC=lab,DC=local,CN=u5,DC=lab,DC=local'
+    }
+
+    It 'skips an empty batch (no marker, no document)' {
+        $empty = [List[PSObject]]::new()
+
+        $path = Join-Path $script:StreamWorkDir ("rt-empty-{0}.clixml" -f ([guid]::NewGuid()))
+        New-StreamingFixtureFile -Path $path -Batches @(, $empty)
+
+        $count = 0
+        foreach ($r in (Read-AceStream -Path $path)) { $count++ }
+        $count | Should -Be 0
+
+        # File must still exist (writer created it) but contains no marker.
+        Test-Path -LiteralPath $path | Should -BeTrue
+        (Get-Content -LiteralPath $path -Raw).Length | Should -Be 0
+    }
+
+    It 'returns no records for a non-existent path' {
+        $missing = Join-Path $script:StreamWorkDir 'never-written.clixml'
+        $count = 0
+        foreach ($r in (Read-AceStream -Path $missing)) { $count++ }
+        $count | Should -Be 0
+    }
+}
