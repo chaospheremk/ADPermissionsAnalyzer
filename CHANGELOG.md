@@ -46,7 +46,12 @@ All six categories above were applied during a debugging pass on the work comput
 - `README.md` — full public-facing rewrite. Replaces template placeholders with project description, prerequisites, quick-start, output schema overview, and links to runbook/spec/changelog.
 - `mkdocs.yml` — fixed `<repo-name>` placeholder in `repo_url` / `repo_name`.
 - `CLAUDE.md` — prepended external-readers disclaimer; updated branching reference from "Dev branch + PR workflow" to "Trunk-based: branch per PR from `main`, delete after merge."
-- **Branching model** — repo switches from permanent `dev` branch with `dev → main` PRs to trunk-based with short-lived branches off `main`. The `.github/workflows/sync-dev.yml` workflow and the `dev` branch itself will be retired in a follow-up.
+- **Branching model** — repo switches from permanent `dev` branch with `dev → main` PRs to trunk-based with short-lived branches off `main`.
+- `.github/workflows/pre-commit-update.yml` — checkout target changed from `dev` to `main` so the weekly autoupdate PR is based on the current trunk.
+
+### Removed
+
+- **`dev` branch and `.github/workflows/sync-dev.yml`**. Final step of the trunk-based migration recorded above. The sync workflow merged `main` into `dev` on every push to `main`; with `dev` retired it has no purpose. `origin/dev` was verified fully merged into `origin/main` before deletion (`git log origin/dev --not origin/main` empty). Older commit messages still reference `dev` for historical context (see the note in `CONTRIBUTING.md`).
 
 ## [0.2.0] - 2026-05-11
 

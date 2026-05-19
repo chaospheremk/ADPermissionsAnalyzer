@@ -2,7 +2,7 @@
 # Copy to: code/.github/workflows/pre-commit-update.yml
 #
 # Runs weekly to check for newer versions of pre-commit hooks
-# (e.g., TruffleHog). Creates a PR on dev if updates are found.
+# (e.g., TruffleHog). Creates a PR against main if updates are found.
 
 name: Update Pre-Commit Hooks
 
@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: dev
+          ref: main
 
       - uses: actions/setup-python@v6
         with:
