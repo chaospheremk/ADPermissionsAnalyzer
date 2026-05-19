@@ -1,7 +1,7 @@
 # CI workflow for ADPermissionsAnalyzer (Invoke-Build)
 #
 # Triggers on pull_request to main only — no push triggers.
-# PR trigger gates merging; push-to-dev and push-to-main are redundant.
+# PR trigger gates merging; a push trigger on main would be redundant.
 #
 # Secret scanning defense layers:
 #   1. Pre-commit hook (first defense) — .pre-commit-config.yaml
