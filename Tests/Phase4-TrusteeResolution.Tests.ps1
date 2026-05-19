@@ -216,6 +216,38 @@ Describe 'Get-DistinctTrusteeSetFromStream' {
         $set = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $missing
         $set.Count | Should -Be 0
     }
+
+    It 'flattens an array-shaped TrusteeSid into individual entries (BUG-003)' {
+        # Defensive contract: nothing in the canonical pipeline produces a
+        # multi-valued TrusteeSid (Add-OwnerAce and ConvertFrom-AdAce both
+        # set it from a single SecurityIdentifier.Value string). But the
+        # Phase C diagnostic captured 845 OrphanSid events whose Message
+        # and Data.sid contained the space-joined $OFS representation of
+        # an Object[]: somewhere upstream the TrusteeSid column had carried
+        # an array, and [HashSet[string]]::Add($array) coerced via $OFS,
+        # planting a compound "SID SID SID ..." key into the set. From
+        # there it propagated as a single multi-SID "trustee" all the way
+        # through OrphanSid emission. Flatten at the streaming reader so
+        # each ACE contributes zero-or-more clean SID entries.
+        $records = [List[PSObject]]::new()
+        $records.Add([PSCustomObject]@{
+            TrusteeSid = [Object[]] @('S-1-5-18', 'S-1-5-11', 'S-1-1-0')
+            AceType    = 'AccessAllowed'
+        })
+
+        $path = Join-Path $script:Phase4StreamDir ("distinct-flatten-{0}.clixml" -f ([guid]::NewGuid()))
+        Write-AceFixtureFile -Path $path -Records $records
+
+        $set = Get-DistinctTrusteeSetFromStream -Phase3AceRecordsPath $path
+
+        $set.Count                | Should -Be 3
+        $set.Contains('S-1-5-18') | Should -BeTrue
+        $set.Contains('S-1-5-11') | Should -BeTrue
+        $set.Contains('S-1-1-0')  | Should -BeTrue
+        # The space-joined compound key produced by HashSet's $OFS coercion
+        # is the BUG-003 fingerprint — it must not appear in the set.
+        $set.Contains('S-1-5-18 S-1-5-11 S-1-1-0') | Should -BeFalse
+    }
 }
 
 Describe 'Resolve-TrusteeSid' {

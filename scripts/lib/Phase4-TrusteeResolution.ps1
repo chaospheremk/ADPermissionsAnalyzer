@@ -266,9 +266,14 @@ function Get-DistinctTrusteeSetFromStream {
 
     $set = [HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($ace in (Read-AceStream -Path $Phase3AceRecordsPath)) {
-        $sid = $ace.TrusteeSid
-        if ($sid) {
-            [void] $set.Add($sid)
+        # Iterate so an array-shaped TrusteeSid (BUG-003) contributes each
+        # element as a clean string instead of $OFS-coercing into a
+        # space-joined compound key when handed to HashSet[string].Add.
+        # foreach over a scalar string yields it once; over $null, zero.
+        foreach ($sid in $ace.TrusteeSid) {
+            if ($sid) {
+                [void] $set.Add([string] $sid)
+            }
         }
     }
 
