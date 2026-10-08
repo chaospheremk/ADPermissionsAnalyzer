@@ -7,6 +7,15 @@
 # so a compromised release has time to be caught and yanked first; this
 # matters because dependabot-automerge.yml merges Actions bumps once CI
 # Gate passes. Security updates ignore the cooldown.
+#
+# groups: all GitHub Actions updates (majors included) arrive as one PR per
+# week. With strict branch protection, separate PRs stall each other: the
+# first to merge leaves the rest behind main, and auto-merge never updates a
+# branch. Trade-off: one broken update holds the group — exclude that action
+# from the group (or add an ignore) until it is fixed.
+#
+# The labels below must exist in the repo:
+#   gh label create dependencies --repo chaospheremk/<repo> --color 0366d6
 
 version: 2
 updates:
@@ -16,6 +25,9 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 14
+    groups:
+      github-actions:
+        patterns: ["*"]
     labels:
       - "dependencies"
 
