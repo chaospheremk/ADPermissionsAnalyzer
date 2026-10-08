@@ -15,6 +15,7 @@ site/
 
 # Generated documentation — standalone scripts only (Export-ScriptDocumentation, rebuilt in CI)
 # Module docs (docs/commands/) are committed and verified by AssertDocsClean in CI
+docs/commands/
 
 # PlatyPS backup files
 *.bak

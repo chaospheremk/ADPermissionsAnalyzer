@@ -3,6 +3,10 @@
 #
 # Creates PRs automatically when new versions of GitHub Actions or
 # Python packages are available. PRs target the default branch (main).
+# cooldown: a release must be 14 days old before Dependabot proposes it,
+# so a compromised release has time to be caught and yanked first; this
+# matters because dependabot-automerge.yml merges Actions bumps once CI
+# Gate passes. Security updates ignore the cooldown.
 
 version: 2
 updates:
@@ -10,6 +14,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 14
     labels:
       - "dependencies"
 
@@ -17,5 +23,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 14
     labels:
       - "dependencies"
